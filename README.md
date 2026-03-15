@@ -227,7 +227,7 @@ socat - TCP:<load_balancer_ip>:8000
 Launch 100 parallel requests simultaneously:
 
 ```bash
-for i in $(seq 1 20); do
+for i in $(seq 1 100); do
 socat - TCP:<load_balancer_ip>:8000 &
 done
 ```
