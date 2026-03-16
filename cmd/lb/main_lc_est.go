@@ -4,26 +4,25 @@ package main
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpf lb ../../bpf/lb_lc_est.c
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/rlimit"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
-	"bufio"
-	"strconv"
-	"github.com/cilium/ebpf/link"
-	"github.com/cilium/ebpf/rlimit"
 )
 
 var (
-	ifname   string
-	backends string
+	ifname string
 )
 
 type BackendEntry struct {
@@ -31,8 +30,20 @@ type BackendEntry struct {
 	Port uint16 `json:"port"`
 }
 
+type ServiceEntry struct {
+	VIP  string `json:"vip"`
+	Port uint16 `json:"port"`
+}
+
 type Config struct {
+	Service  ServiceEntry   `json:"service"`
 	Backends []BackendEntry `json:"backends"`
+}
+
+type lbService struct {
+	Vip  uint32
+	Port uint16
+	Pad  uint16
 }
 
 func parseIPv4(s string) (uint32, error) {
@@ -44,7 +55,69 @@ func parseIPv4(s string) (uint32, error) {
 }
 
 func htons(port uint16) uint16 {
-	return (port << 8) | (port >> 8)
+	return (port<<8)&0xff00 | port>>8
+}
+
+func addService(objs *lbObjects, ip string, port uint16) {
+
+	vip, err := parseIPv4(ip)
+	if err != nil {
+		log.Println("invalid vip:", err)
+		return
+	}
+
+	key := lbService{
+		Vip:  vip,
+		Port: htons(port),
+	}
+
+	val := true
+
+	err = objs.lbMaps.Services.Put(&key, &val)
+	if err != nil {
+		log.Println("failed adding service:", err)
+		return
+	}
+
+	log.Println("service added:", ip, port)
+}
+
+func deleteService(objs *lbObjects, ip string, port uint16) {
+
+	vip, err := parseIPv4(ip)
+	if err != nil {
+		log.Println("invalid vip:", err)
+		return
+	}
+
+	key := lbService{
+		Vip:  vip,
+		Port: htons(port),
+	}
+
+	err = objs.lbMaps.Services.Delete(&key)
+	if err != nil {
+		log.Println("failed deleting service:", err)
+		return
+	}
+
+	log.Println("service deleted:", ip, port)
+}
+
+func listServices(objs *lbObjects) {
+
+	iter := objs.lbMaps.Services.Iterate()
+
+	var k lbService
+	var v bool
+
+	for iter.Next(&k, &v) {
+
+		ip := make(net.IP, 4)
+		binary.LittleEndian.PutUint32(ip, k.Vip)
+
+		fmt.Println("service:", ip, "port:", htons(k.Port))
+	}
 }
 
 func addBackend(objs *lbObjects, ip string, port uint16) {
@@ -86,11 +159,7 @@ func addBackend(objs *lbObjects, ip string, port uint16) {
 	}
 
 	count++
-	err = objs.lbMaps.BackendCount.Put(key, count)
-	if err != nil {
-		log.Println("failed updating backend count:", err)
-		return
-	}
+	objs.lbMaps.BackendCount.Put(key, count)
 
 	log.Println("backend added:", ip, port)
 }
@@ -178,46 +247,33 @@ func listBackends(objs *lbObjects) {
 
 func main() {
 
-	flag.StringVar(&ifname, "i", "lo", "Network interface to attach eBPF programs")
-
+	flag.StringVar(&ifname, "i", "lo", "iface")
 	var configFile string
-	flag.StringVar(&configFile, "config", "configs/backends_lc.json", "Backend configuration file")
+	flag.StringVar(&configFile, "config", "configs/backends_lc.json", "config")
 	flag.Parse()
 
 	data, err := os.ReadFile(configFile)
 	if err != nil {
-		log.Fatalf("Failed to read config file: %v", err)
+		log.Fatal(err)
 	}
 
 	var cfg Config
-	err = json.Unmarshal(data, &cfg)
-	if err != nil {
-		log.Fatalf("Invalid config format: %v", err)
-	}
-
-	if len(cfg.Backends) == 0 {
-		log.Fatal("No backends defined in config file")
-	}
+	json.Unmarshal(data, &cfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := rlimit.RemoveMemlock(); err != nil {
-		log.Fatal("Removing memlock:", err)
-	}
+	rlimit.RemoveMemlock()
 
 	var objs lbObjects
-	if err := loadLbObjects(&objs, nil); err != nil {
-		log.Fatal("Loading eBPF objects:", err)
-	}
+	loadLbObjects(&objs, nil)
 	defer objs.Close()
+
+	addService(&objs, cfg.Service.VIP, cfg.Service.Port)
 
 	for i, backend := range cfg.Backends {
 
-		backIP, err := parseIPv4(backend.IP)
-		if err != nil {
-			log.Fatalf("Invalid backend IP %q: %v", backend.IP, err)
-		}
+		backIP, _ := parseIPv4(backend.IP)
 
 		backEp := lbBackend{
 			Ip:    backIP,
@@ -225,24 +281,14 @@ func main() {
 			Conns: 0,
 		}
 
-		if err := objs.lbMaps.Backends.Put(uint32(i), &backEp); err != nil {
-			log.Fatalf("Error adding backend #%d to eBPF map: %v", i, err)
-		}
-
-		log.Printf("Added backend #%d: %s:%d", i, backend.IP, backend.Port)
+		objs.lbMaps.Backends.Put(uint32(i), &backEp)
 	}
 
 	count := uint32(len(cfg.Backends))
 	key := uint32(0)
+	objs.lbMaps.BackendCount.Put(key, count)
 
-	if err := objs.lbMaps.BackendCount.Put(key, count); err != nil {
-		log.Fatalf("Failed to update backend count map: %v", err)
-	}
-
-	iface, err := net.InterfaceByName(ifname)
-	if err != nil {
-		log.Fatalf("Getting interface %s: %s", ifname, err)
-	}
+	iface, _ := net.InterfaceByName(ifname)
 
 	xdplink, err := link.AttachXDP(link.XDPOptions{
 		Program:   objs.XdpLoadBalancer,
@@ -250,11 +296,11 @@ func main() {
 		Flags:     link.XDPGenericMode,
 	})
 	if err != nil {
-		log.Fatal("Attaching XDP:", err)
+		log.Fatal(err)
 	}
 	defer xdplink.Close()
 
-	log.Println("XDP Load Balancer successfully attached and running")
+	log.Println("XDP LB running")
 
 	reader := bufio.NewReader(os.Stdin)
 
@@ -263,22 +309,14 @@ func main() {
 		for {
 
 			select {
-
 			case <-ctx.Done():
 				return
-
 			default:
 
 				fmt.Print("lb> ")
+				line, _ := reader.ReadString('\n')
 
-				line, err := reader.ReadString('\n')
-				if err != nil {
-					continue
-				}
-
-				line = strings.TrimSpace(line)
-				parts := strings.Fields(line)
-
+				parts := strings.Fields(strings.TrimSpace(line))
 				if len(parts) == 0 {
 					continue
 				}
@@ -286,49 +324,33 @@ func main() {
 				switch parts[0] {
 
 				case "add":
-
-					if len(parts) != 3 {
-						fmt.Println("usage: add <ip> <port>")
-						continue
-					}
-
-					p, err := strconv.Atoi(parts[2])
-					if err != nil {
-						fmt.Println("invalid port")
-						continue
-					}
-
+					p, _ := strconv.Atoi(parts[2])
 					addBackend(&objs, parts[1], uint16(p))
 
 				case "del":
-
-					if len(parts) != 3 {
-						fmt.Println("usage: del <ip> <port>")
-						continue
-					}
-
-					p, err := strconv.Atoi(parts[2])
-					if err != nil {
-						fmt.Println("invalid port")
-						continue
-					}
-
+					p, _ := strconv.Atoi(parts[2])
 					deleteBackend(&objs, parts[1], uint16(p))
 
 				case "list":
-
 					listBackends(&objs)
 
-				default:
+				case "addsvc":
+					p, _ := strconv.Atoi(parts[2])
+					addService(&objs, parts[1], uint16(p))
 
-					fmt.Println("commands: add <ip> <port>, del <ip> <port>, list")
+				case "delsvc":
+					p, _ := strconv.Atoi(parts[2])
+					deleteService(&objs, parts[1], uint16(p))
+
+				case "listsvc":
+					listServices(&objs)
+
+				default:
+					fmt.Println("add del list addsvc delsvc listsvc")
 				}
 			}
 		}
-
 	}()
 
 	<-ctx.Done()
-
-	log.Println("Received signal, exiting...")
 }

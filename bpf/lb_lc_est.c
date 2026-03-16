@@ -5,13 +5,18 @@
 #include "parse_helpers.h"
 
 #define MAX_BACKENDS 100
+#define MAX_SERVICES 10
 #define ETH_ALEN 6
 #define AF_INET 2
 #define IPROTO_TCP 6
 #define MAX_TCP_CHECK_WORDS 750
 
+struct service
+{
+  __u32 vip;  // virtual IP for the service
+  __u16 port; // service port
+};
 // every backend's ip, port, and number of active connections
-
 struct backend
 {
   __u32 ip;
@@ -52,6 +57,14 @@ struct
   __type(key, __u32);
   __type(value, struct backend);
 } backends SEC(".maps");
+
+struct
+{
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, MAX_SERVICES);
+  __type(key, struct service);
+  __type(value, bool);
+} services SEC(".maps");
 
 // Get the number of backends from user space
 struct
@@ -292,11 +305,6 @@ int xdp_load_balancer(struct xdp_md *ctx)
   if ((void *)(tcp + 1) > data_end)
     return XDP_PASS;
 
-  // We could technically load-balance all the traffic but
-  // we only focus on port 8000 to not impact any other network traffic in the playground
-  if (bpf_ntohs(tcp->source) != 8000 && bpf_ntohs(tcp->dest) != 8000)
-    return XDP_PASS;
-
   // bpf_printk("IN: SRC IP %pI4 src port %d dest port %d", &ip->saddr, bpf_ntohs(tcp->source), bpf_ntohs(tcp->dest));
   /*//bpf_printk("IN: SRC MAC %02x:%02x:%02x:%02x:%02x:%02x -> DST MAC "
              "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -386,6 +394,13 @@ int xdp_load_balancer(struct xdp_md *ctx)
   }
   else
   {
+    struct service svc_key = {
+        .vip = ip->daddr,
+        .port = tcp->dest,
+    };
+    bool *service_exists = bpf_map_lookup_elem(&services, &svc_key);
+    if (!service_exists)
+      return XDP_PASS;
     // conntrack entry not found, hence packet is from client
     // Build the client-facing five-tuple for backendtrack
     struct five_tuple_t bt_key = make_bt_key(ip->saddr, ip->daddr,

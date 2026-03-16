@@ -1,597 +1,356 @@
-// go:build ignore
-#include "vmlinux.h"
-#include <bpf/bpf_endian.h>
-#include <bpf/bpf_helpers.h>
-#include "parse_helpers.h"
+//go:build lc_syn
+package main
 
-#define MAX_BACKENDS 100
-#define ETH_ALEN 6
-#define AF_INET 2
-#define IPROTO_TCP 6
-#define MAX_TCP_CHECK_WORDS 750
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpf lb2 ../../bpf/lb_lc_syn.c
 
-// every backend's ip, port, and number of active connections
+import (
+	"bufio"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/rlimit"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+)
 
-struct backend
-{
-  __u32 ip;
-  __u16 port;
-  __u32 conns;
-  __u16 weight;
-};
+var (
+	ifname string
+)
 
-struct five_tuple_t
-{
-  __u32 src_ip;
-  __u32 dst_ip;
-  __u16 src_port;
-  __u16 dst_port;
-  __u8 protocol;
-};
-
-// Connection state lives ONLY here (conntrack map).
-// State values:
-//   0 = SYN seen, not yet established
-//   1 = Established
-//   2 = Client sent FIN first
-//   3 = Backend sent FIN first
-//   4 = Both sides have FIN'd → delete on next ACK
-struct conn_meta
-{
-  __u32 ip;          // client IP (used for backend traffic to rewrite back to client IP)
-  __u32 backend_idx; // used for client traffic to index into backends map
-  __u8 state;
-};
-
-// Backend IPs
-// We could also include port information but we simplify
-// and assume that both LB and Backend listen on the same port for requests
-struct
-{
-  __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, MAX_BACKENDS);
-  __type(key, __u32);
-  __type(value, struct backend);
-} backends SEC(".maps");
-
-// Get the number of backends from user space
-struct
-{
-  __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, 1);
-  __type(key, __u32);
-  __type(value, __u32);
-} backend_count SEC(".maps");
-
-// conntrack: keyed by (LB-side five-tuple as seen FROM the backend)
-//   src_ip   = LB IP
-//   dst_ip   = backend IP
-//   src_port = client source port  (LB preserves it when forwarding)
-//   dst_port = destination port (e.g. 8000)
-//
-// This is the store for conn_meta / state.
-struct
-{
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 1000);
-  __type(key, struct five_tuple_t);
-  __type(value, struct conn_meta);
-} conntrack SEC(".maps");
-
-// backendtrack: keyed by the client-facing five-tuple
-//   src_ip   = client IP
-//   dst_ip   = LB IP
-//   src_port = client source port
-//   dst_port = destination port
-//
-// Value is NOT conn_meta any more – it is the conntrack key so we
-// can look up the single authoritative conn_meta without duplicating state.
-struct
-{
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 1000);
-  __type(key, struct five_tuple_t);
-  __type(value, struct five_tuple_t); //  stores the conntrack lookup key
-} backendtrack SEC(".maps");
-
-// helpers
-
-static __always_inline void log_fib_error(int rc)
-{
-  switch (rc)
-  {
-  case BPF_FIB_LKUP_RET_BLACKHOLE:
-    bpf_printk("FIB lookup failed: BLACKHOLE route. Check 'ip route' – the "
-               "destination may have a blackhole rule.");
-    break;
-  case BPF_FIB_LKUP_RET_UNREACHABLE:
-    bpf_printk("FIB lookup failed: UNREACHABLE route. Kernel routing table "
-               "explicitly marks this destination unreachable.");
-    break;
-  case BPF_FIB_LKUP_RET_PROHIBIT:
-    bpf_printk("FIB lookup failed: PROHIBITED route. Forwarding is "
-               "administratively blocked.");
-    break;
-  case BPF_FIB_LKUP_RET_NOT_FWDED:
-    bpf_printk("FIB lookup failed: NOT_FORWARDED. Destination likely on the "
-               "same subnet – try BPF_FIB_LOOKUP_DIRECT for on-link lookup.");
-    break;
-  case BPF_FIB_LKUP_RET_FWD_DISABLED:
-    bpf_printk("FIB lookup failed: FORWARDING DISABLED. Enable it via 'sysctl "
-               "-w net.ipv4.ip_forward=1' or IPv6 equivalent.");
-    break;
-  case BPF_FIB_LKUP_RET_UNSUPP_LWT:
-    bpf_printk("FIB lookup failed: UNSUPPORTED LWT. The route uses a "
-               "lightweight tunnel not supported by bpf_fib_lookup().");
-    break;
-  case BPF_FIB_LKUP_RET_NO_NEIGH:
-    bpf_printk("FIB lookup failed: NO NEIGHBOR ENTRY. ARP/NDP unresolved – "
-               "check 'ip neigh show' or ping the target to populate cache.");
-    break;
-  case BPF_FIB_LKUP_RET_FRAG_NEEDED:
-    bpf_printk("FIB lookup failed: FRAGMENTATION NEEDED. Packet exceeds MTU; "
-               "adjust packet size or enable PMTU discovery.");
-    break;
-  case BPF_FIB_LKUP_RET_NO_SRC_ADDR:
-    bpf_printk(
-        "FIB lookup failed: NO SOURCE ADDRESS. Kernel couldn’t choose a source "
-        "IP – ensure the interface has an IP in the correct subnet.");
-    break;
-  default:
-    bpf_printk("FIB lookup failed: rc=%d (unknown). Check routing and ARP/NDP "
-               "configuration.",
-               rc);
-    break;
-  }
+type BackendEntry struct {
+	IP   string `json:"ip"`
+	Port uint16 `json:"port"`
 }
 
-static __always_inline __u16 recalc_ip_checksum(struct iphdr *ip)
-{
-  // Clear checksum
-  ip->check = 0;
-
-  // Compute incremental checksum difference over the header
-  __u64 csum = bpf_csum_diff(0, 0, (unsigned int *)ip, sizeof(struct iphdr), 0);
-
-// fold 64-bit csum to 16 bits (the “carry add” loop)
-#pragma unroll
-  for (int i = 0; i < 4; i++)
-  {
-    if (csum >> 16)
-      csum = (csum & 0xffff) + (csum >> 16);
-  }
-
-  return ~csum;
+type ServiceEntry struct {
+	VIP  string `json:"vip"`
+	Port uint16 `json:"port"`
 }
 
-static __always_inline __u16 recalc_tcp_checksum(struct tcphdr *tcph, struct iphdr *iph, void *data_end)
-{
-  tcph->check = 0;
-  __u32 sum = 0;
-
-  // Pseudo-header: IP addresses
-  sum += (__u16)(iph->saddr >> 16) + (__u16)(iph->saddr & 0xFFFF);
-  sum += (__u16)(iph->daddr >> 16) + (__u16)(iph->daddr & 0xFFFF);
-  sum += bpf_htons(IPPROTO_TCP);
-
-  // Pseudo-header: TCP Length (Total IP len - IP header len)
-  // IMPORTANT: Use the IP header, not data_end
-  __u16 tcp_len = bpf_ntohs(iph->tot_len) - (iph->ihl * 4);
-  sum += bpf_htons(tcp_len);
-
-  // TCP Header + Payload
-  // Use a safe bound check against data_end for the pointer,
-  // but the loop limit should be based on the actual packet size
-  __u16 *ptr = (__u16 *)tcph;
-  for (int i = 0; i < MAX_TCP_CHECK_WORDS; i++)
-  {
-    if ((void *)(ptr + 1) > data_end || (void *)ptr >= (void *)tcph + tcp_len)
-      break;
-    sum += *ptr;
-    ptr++;
-  }
-
-  // Handle odd-length packets (the last byte)
-  if (tcp_len & 1)
-  {
-    if ((void *)ptr + 1 <= data_end)
-    {
-      sum += bpf_htons(*(__u8 *)ptr << 8);
-    }
-  }
-
-  while (sum >> 16)
-    sum = (sum & 0xFFFF) + (sum >> 16);
-
-  return ~sum;
+type Config struct {
+	Service  ServiceEntry   `json:"service"`
+	Backends []BackendEntry `json:"backends"`
 }
 
-static __always_inline int fib_lookup_v4_full(struct xdp_md *ctx,
-                                              struct bpf_fib_lookup *fib,
-                                              __u32 src, __u32 dst,
-                                              __u16 tot_len)
-{
-  // Zero and populate only what a full lookup needs
-  __builtin_memset(fib, 0, sizeof(*fib));
-  // Hardcode address family: AF_INET for IPv4
-  fib->family = AF_INET;
-  // Source IPv4 address used by the kernel for policy routing and source
-  // address–based decisions
-  fib->ipv4_src = src;
-  // Destination IPv4 address (in network byte order)
-  // The address we want to reach; used to find the correct egress route
-  fib->ipv4_dst = dst;
-  // Hardcoded Layer 4 protocol: TCP, UDP, ICMP
-  fib->l4_protocol = IPPROTO_TCP;
-  // Total length of the IPv4 packet (header + payload)
-  fib->tot_len = tot_len;
-  // Interface for the lookup
-  fib->ifindex = ctx->ingress_ifindex;
-
-  return bpf_fib_lookup(ctx, fib, sizeof(*fib), 0);
+type lb2Service struct {
+	Vip  uint32
+	Port uint16
+	Pad  uint16
 }
 
-// Helper: build the conntrack key for a given (lb_ip, backend_ip,
-// client_src_port, dest_port).
-
-static __always_inline struct five_tuple_t
-make_ct_key(__u32 lb_ip, __u32 backend_ip,
-            __u16 client_src_port, __u16 dest_port)
-{
-  struct five_tuple_t k = {};
-  k.src_ip = lb_ip;
-  k.dst_ip = backend_ip;
-  k.src_port = client_src_port;
-  k.dst_port = dest_port;
-  k.protocol = IPPROTO_TCP;
-  return k;
+func parseIPv4(s string) (uint32, error) {
+	ip := net.ParseIP(s).To4()
+	if ip == nil {
+		return 0, fmt.Errorf("invalid IPv4: %s", s)
+	}
+	return binary.LittleEndian.Uint32(ip), nil
 }
 
-// Helper: build the backendtrack key for the client-facing direction
-
-static __always_inline struct five_tuple_t
-make_bt_key(__u32 client_ip, __u32 lb_ip,
-            __u16 client_src_port, __u16 dest_port)
-{
-  struct five_tuple_t k = {};
-  k.src_ip = client_ip;
-  k.dst_ip = lb_ip;
-  k.src_port = client_src_port;
-  k.dst_port = dest_port;
-  k.protocol = IPPROTO_TCP;
-  return k;
+func htons(port uint16) uint16 {
+	return (port<<8)&0xff00 | port>>8
 }
 
-// XDP program
+func addService(objs *lb2Objects, ip string, port uint16) {
 
-SEC("xdp")
-int xdp_load_balancer(struct xdp_md *ctx)
-{
-  void *data_end = (void *)(long)ctx->data_end;
-  void *data = (void *)(long)ctx->data;
+	vip, err := parseIPv4(ip)
+	if err != nil {
+		log.Println("invalid vip:", err)
+		return
+	}
 
-  struct hdr_cursor nh = {.pos = data};
+	key := lb2Service{
+		Vip:  vip,
+		Port: htons(port),
+	}
 
-  // parse Ethernet header
-  struct ethhdr *eth;
-  int eth_type = parse_ethhdr(&nh, data_end, &eth);
-  if (eth_type != bpf_htons(ETH_P_IP))
-    return XDP_PASS;
+	val := true
 
-  // parse IP header
-  struct iphdr *ip;
-  int ip_type = parse_iphdr(&nh, data_end, &ip);
-  if ((void *)(ip + 1) > data_end)
-    return XDP_PASS;
-  if (ip->protocol != IPPROTO_TCP)
-    // for simplicity, only load balance TCP traffic
-    return XDP_PASS;
+	err = objs.lb2Maps.Services.Put(&key, &val)
+	if err != nil {
+		log.Println("failed adding service:", err)
+		return
+	}
 
-  // parse tcp header
-  struct tcphdr *tcp;
-  int tcp_type = parse_tcphdr(&nh, data_end, &tcp);
-  if ((void *)(tcp + 1) > data_end)
-    return XDP_PASS;
-
-  // We could technically load-balance all the traffic but
-  // we only focus on port 8000 to not impact any other network traffic in the playground
-  if (bpf_ntohs(tcp->source) != 8000 && bpf_ntohs(tcp->dest) != 8000)
-    return XDP_PASS;
-
-  // bpf_printk("IN: SRC IP %pI4 src port %d dest port %d", &ip->saddr, bpf_ntohs(tcp->source), bpf_ntohs(tcp->dest));
-  /*//bpf_printk("IN: SRC MAC %02x:%02x:%02x:%02x:%02x:%02x -> DST MAC "
-             "%02x:%02x:%02x:%02x:%02x:%02x",
-             eth->h_source[0], eth->h_source[1], eth->h_source[2],
-             eth->h_source[3], eth->h_source[4], eth->h_source[5],
-             eth->h_dest[0], eth->h_dest[1], eth->h_dest[2], eth->h_dest[3],
-             eth->h_dest[4], eth->h_dest[5]);*/
-
-  // store Load Balancer IP for later
-  __u32 lb_ip = ip->daddr;
-
-  struct bpf_fib_lookup fib = {};
-
-  // Build the conntrack reverse-lookup key (used when packet came
-  // from the backend toward the LB).
-  struct five_tuple_t ct_key_from_backend = {};
-  ct_key_from_backend.src_ip = ip->daddr;     // LB IP
-  ct_key_from_backend.dst_ip = ip->saddr;     // backend IP
-  ct_key_from_backend.src_port = tcp->dest;   // client src port
-  ct_key_from_backend.dst_port = tcp->source; // dest port on backend side
-  ct_key_from_backend.protocol = IPPROTO_TCP;
-
-  struct conn_meta *ct = bpf_map_lookup_elem(&conntrack, &ct_key_from_backend);
-
-  if (ct)
-  {
-    // bpf_printk("Packet from backend %pI4:%d, conn state=%d", &ip->saddr, bpf_ntohs(tcp->source), ct->state);
-    //  packet arrived from backend, conntrack entry exists
-    //   check if backend is terminating the connection
-    if (tcp->fin)
-    {
-      struct conn_meta updated = *ct;
-      if (ct->state == 2)
-      {
-        // Client already sent FIN , both sides done
-        updated.state = 4;
-      }
-      else
-      {
-        // Backend FIN is first
-        updated.state = 3;
-      }
-      bpf_map_update_elem(&conntrack, &ct_key_from_backend, &updated, BPF_ANY);
-      ct = bpf_map_lookup_elem(&conntrack, &ct_key_from_backend);
-      if (!ct)
-        return XDP_ABORTED;
-    }
-
-    //  Cleanup: final ACK or RST
-    if ((tcp->ack && ct->state == 4 && tcp->fin == 0) || tcp->rst)
-    {
-      // Decrement backend connection counter
-      struct backend *b = bpf_map_lookup_elem(&backends, &ct->backend_idx);
-      if (!b)
-        return XDP_ABORTED;
-      struct backend nb = *b;
-      if (nb.conns > 0)
-        nb.conns -= 1;
-      bpf_map_update_elem(&backends, &ct->backend_idx, &nb, BPF_ANY);
-
-      // Delete conntrack entry
-      bpf_map_delete_elem(&conntrack, &ct_key_from_backend);
-
-      // Delete backendtrack entry (key is client-facing direction)
-      struct five_tuple_t bt_key = make_bt_key(ct->ip, ip->daddr,
-                                               tcp->dest, // client src port
-                                               tcp->source);
-      bpf_map_delete_elem(&backendtrack, &bt_key);
-
-      /* bpf_printk("connection deleted. (Backend path) Backend %pI4 conns=%d",
-                 &b->ip, nb.conns)*/
-      ;
-    }
-
-    // FIB lookup: send reply toward the client
-    int rc = fib_lookup_v4_full(ctx, &fib, ip->daddr, ct->ip,
-                                bpf_ntohs(ip->tot_len));
-    if (rc != BPF_FIB_LKUP_RET_SUCCESS)
-    {
-      log_fib_error(rc);
-      return XDP_ABORTED;
-    }
-
-    // Rewrite destination to client IP/MAC
-    ip->daddr = ct->ip;
-    __builtin_memcpy(eth->h_dest, fib.dmac, ETH_ALEN);
-  }
-  else
-  {
-    // conntrack entry not found, hence packet is from client
-    // Build the client-facing five-tuple for backendtrack
-    struct five_tuple_t bt_key = make_bt_key(ip->saddr, ip->daddr,
-                                             tcp->source, tcp->dest);
-
-    struct five_tuple_t *ct_key_ptr =
-        bpf_map_lookup_elem(&backendtrack, &bt_key);
-
-    struct backend *b;
-    struct five_tuple_t ct_key = {};
-
-    if (!ct_key_ptr)
-    {
-      if (tcp->syn == 0)
-      {
-        // bpf_printk("ABORT_1 no_ct_entry_non_syn");
-        return XDP_ABORTED;
-      }
-      // bpf_printk("yessss");
-
-      __u32 key = 0;
-      __u32 min_conn = (__u32)-1;
-
-__u32 zero = 0;
-      __u32 *num_backends = bpf_map_lookup_elem(&backend_count, &zero);
-      if (!num_backends)
-        return XDP_ABORTED;
-
-      __u32 best_key = 0;
-      __u32 best_conns = 0;
-      __u32 best_weight = 0;
-      __u8 found = 0;
-
-      for (__u32 i = 0; i < MAX_BACKENDS; i++)
-      {
-        if (i >= *num_backends)
-          break;
-
-        __u32 k = i;
-        struct backend *candidate = bpf_map_lookup_elem(&backends, &k);
-        if (!candidate || candidate->weight == 0)
-          continue;
-
-        if (!found)
-        {
-          // First valid backend — take it unconditionally
-          best_key = k;
-          best_conns = candidate->conns;
-          best_weight = candidate->weight;
-          found = 1;
-          continue;
-        }
-
-        // Compare: candidate->conns / candidate->weight  <  best_conns / best_weight
-        // Cross-multiply to avoid division:
-        //   candidate->conns * best_weight  <  best_conns * candidate->weight
-        if (candidate->conns * best_weight < best_conns * candidate->weight)
-        {
-          best_key = k;
-          best_conns = candidate->conns;
-          best_weight = candidate->weight;
-        }
-      }
-
-      if (!found)
-        return XDP_ABORTED;
-
-      __u32 key = best_key;
-
-      b = bpf_map_lookup_elem(&backends, &key);
-      if (!b)
-      {
-        // bpf_printk("ABORT_3 selected_backend_lookup_failed");
-        return XDP_ABORTED;
-      }
-
-      ct_key = make_ct_key(ip->daddr, b->ip, tcp->source, b->port);
-
-      struct conn_meta meta = {};
-      meta.ip = ip->saddr;
-      meta.backend_idx = key;
-      meta.state = 0;
-
-      if (bpf_map_update_elem(&conntrack, &ct_key, &meta, BPF_ANY) != 0)
-      {
-        // bpf_printk("ABORT_4 conntrack_insert_failed");
-        return XDP_ABORTED;
-      }
-
-      if (bpf_map_update_elem(&backendtrack, &bt_key, &ct_key, BPF_ANY) != 0)
-      {
-        // bpf_printk("ABORT_5 backendtrack_insert_failed");
-        return XDP_ABORTED;
-      }
-      // Increment connection counter for the backend
-      struct backend nb = *b;
-      nb.conns += 1;
-      bpf_map_update_elem(&backends, &ct->backend_idx, &nb, BPF_ANY);
-      /* bpf_printk("New connection: Client %pI4:%d -> Backend %pI4",
-                 &ip->saddr, bpf_ntohs(tcp->source), &b->ip)*/
-      ;
-    }
-    else
-    {
-      // ── Existing connection: look up the live conn_meta ──────
-      ct_key = *ct_key_ptr;
-
-      ct = bpf_map_lookup_elem(&conntrack, &ct_key);
-      if (!ct)
-        return XDP_ABORTED;
-
-      b = bpf_map_lookup_elem(&backends, &ct->backend_idx);
-      if (!b)
-        return XDP_ABORTED;
-
-      //  If state is 0 and first non-SYN packet , meaning connection established
-      if (ct->state == 0 && tcp->syn == 0)
-      {
-        struct conn_meta updated = *ct;
-        updated.state = 1; // connection established, update state to 1
-        // Only one write needed , backendtrack points here
-        bpf_map_update_elem(&conntrack, &ct_key, &updated, BPF_ANY);
-
-        /* bpf_printk("conn established : Backend %pI4 conns=%d",
-                   &b->ip, nb.conns);*/
-        ct = bpf_map_lookup_elem(&conntrack, &ct_key);
-        if (!ct)
-          return XDP_ABORTED;
-      }
-
-      // if FIN packet, connection is terminating
-      if (tcp->fin)
-      {
-        struct conn_meta updated = *ct;
-        if (ct->state == 3)
-        {
-          // Backend already sent FIN, both sides done, update state to 4 to wait for final ACK before cleanup
-          updated.state = 4;
-        }
-        else
-        {
-          // Client FIN is first
-          updated.state = 2; // update state to 2 to wait for backend FIN
-        }
-        // Single write to conntrack , both paths will see it
-        bpf_map_update_elem(&conntrack, &ct_key, &updated, BPF_ANY);
-
-        ct = bpf_map_lookup_elem(&conntrack, &ct_key);
-        if (!ct)
-          return XDP_ABORTED;
-      }
-
-      // cleanup: final ACK or RST
-      if ((tcp->ack && ct->state == 4 && tcp->fin == 0) || tcp->rst)
-      {
-        struct backend nb = *b;
-        // decrement backend connection counter
-        if (nb.conns > 0)
-          nb.conns -= 1;
-        bpf_map_update_elem(&backends, &ct->backend_idx, &nb, BPF_ANY);
-        // delete conntrack and backendtrack entries
-        bpf_map_delete_elem(&conntrack, &ct_key);
-        bpf_map_delete_elem(&backendtrack, &bt_key);
-
-        /* bpf_printk("conn deleted (client path). Backend %pI4 conns=%d",
-                   &b->ip, nb.conns)*/
-        ;
-      }
-    }
-
-    // FIB lookup: forward packet toward the backend
-    int rc = fib_lookup_v4_full(ctx, &fib, ip->daddr, b->ip,
-                                bpf_ntohs(ip->tot_len));
-    if (rc != BPF_FIB_LKUP_RET_SUCCESS)
-    {
-      log_fib_error(rc);
-      return XDP_ABORTED;
-    }
-
-    // Rewrite destination to backend IP/MAC and port
-    ip->daddr = b->ip;
-    tcp->dest = b->port;
-    __builtin_memcpy(eth->h_dest, fib.dmac, ETH_ALEN);
-
-    // bpf_printk("Backend %pI4:%d conns=%d", &b->ip, b->port, b->conns);
-  }
-
-  // rewrite: source IP/MAC = LB
-  ip->saddr = lb_ip;
-  __builtin_memcpy(eth->h_source, fib.smac, ETH_ALEN);
-
-  // Recalculate checksums
-  ip->check = recalc_ip_checksum(ip);
-  tcp->check = recalc_tcp_checksum(tcp, ip, data_end);
-
-  /*//bpf_printk("OUT: SRC IP %pI4 -> DST IP %pI4", &ip->saddr, &ip->daddr);
-  //bpf_printk("OUT SRC MAC %02x:%02x", eth->h_source[0], eth->h_source[1]);
-  //bpf_printk("OUT SRC MAC %02x:%02x", eth->h_source[2], eth->h_source[3]);
-  //bpf_printk("OUT SRC MAC %02x:%02x", eth->h_source[4], eth->h_source[5]);
-
-  //bpf_printk("OUT DST MAC %02x:%02x", eth->h_dest[0], eth->h_dest[1]);
-  //bpf_printk("OUT DST MAC %02x:%02x", eth->h_dest[2], eth->h_dest[3]);
-  //bpf_printk("OUT DST MAC %02x:%02x", eth->h_dest[4], eth->h_dest[5]);*/
-
-  return XDP_TX;
+	log.Println("service added:", ip, port)
 }
 
-char _license[] SEC("license") = "GPL";
+func deleteService(objs *lb2Objects, ip string, port uint16) {
+
+	vip, err := parseIPv4(ip)
+	if err != nil {
+		log.Println("invalid vip:", err)
+		return
+	}
+
+	key := lb2Service{
+		Vip:  vip,
+		Port: htons(port),
+	}
+
+	err = objs.lb2Maps.Services.Delete(&key)
+	if err != nil {
+		log.Println("failed deleting service:", err)
+		return
+	}
+
+	log.Println("service deleted:", ip, port)
+}
+
+func listServices(objs *lb2Objects) {
+
+	iter := objs.lb2Maps.Services.Iterate()
+
+	var k lb2Service
+	var v bool
+
+	for iter.Next(&k, &v) {
+
+		ip := make(net.IP, 4)
+		binary.LittleEndian.PutUint32(ip, k.Vip)
+
+		fmt.Println("service:", ip, "port:", htons(k.Port))
+	}
+}
+
+func addBackend(objs *lb2Objects, ip string, port uint16) {
+
+	backIP, err := parseIPv4(ip)
+	if err != nil {
+		log.Println("invalid ip:", err)
+		return
+	}
+
+	key := uint32(0)
+	var count uint32
+
+	err = objs.lb2Maps.BackendCount.Lookup(key, &count)
+	if err != nil {
+		log.Println("failed reading backend count:", err)
+		return
+	}
+
+	for i := uint32(0); i < count; i++ {
+		var b lb2Backend
+		err := objs.lb2Maps.Backends.Lookup(i, &b)
+		if err == nil && b.Ip == backIP && b.Port == htons(port) {
+			log.Println("backend already exists:", ip, port)
+			return
+		}
+	}
+
+	backEp := lb2Backend{
+		Ip:    backIP,
+		Port:  htons(port),
+		Conns: 0,
+	}
+
+	err = objs.lb2Maps.Backends.Put(count, &backEp)
+	if err != nil {
+		log.Println("failed adding backend:", err)
+		return
+	}
+
+	count++
+	objs.lb2Maps.BackendCount.Put(key, count)
+
+	log.Println("backend added:", ip, port)
+}
+
+func deleteBackend(objs *lb2Objects, ip string, port uint16) {
+
+	backIP, err := parseIPv4(ip)
+	if err != nil {
+		log.Println("invalid ip:", err)
+		return
+	}
+
+	key := uint32(0)
+	var count uint32
+
+	err = objs.lb2Maps.BackendCount.Lookup(key, &count)
+	if err != nil {
+		log.Println("failed reading backend count:", err)
+		return
+	}
+
+	for i := uint32(0); i < count; i++ {
+
+		var b lb2Backend
+		err := objs.lb2Maps.Backends.Lookup(i, &b)
+		if err != nil {
+			continue
+		}
+
+		if b.Ip == backIP && b.Port == htons(port) {
+
+			if b.Conns != 0 {
+				log.Println("cannot delete backend, active connections:", b.Conns)
+				return
+			}
+
+			last := count - 1
+
+			if i != last {
+				var lastBackend lb2Backend
+				err := objs.lb2Maps.Backends.Lookup(last, &lastBackend)
+				if err == nil {
+					objs.lb2Maps.Backends.Put(i, &lastBackend)
+				}
+			}
+
+			objs.lb2Maps.Backends.Delete(last)
+
+			count--
+			objs.lb2Maps.BackendCount.Put(key, count)
+
+			log.Println("backend deleted:", ip, port)
+			return
+		}
+	}
+
+	log.Println("backend not found:", ip, port)
+}
+
+func listBackends(objs *lb2Objects) {
+
+	var count uint32
+	key := uint32(0)
+
+	err := objs.lb2Maps.BackendCount.Lookup(key, &count)
+	if err != nil {
+		fmt.Println("failed to read backend count")
+		return
+	}
+
+	for i := uint32(0); i < count; i++ {
+
+		var b lb2Backend
+		err := objs.lb2Maps.Backends.Lookup(i, &b)
+		if err != nil {
+			continue
+		}
+
+		ip := make(net.IP, 4)
+		binary.LittleEndian.PutUint32(ip, b.Ip)
+
+		fmt.Println(i, ip, "port:", htons(b.Port), "conns:", b.Conns)
+	}
+}
+
+func main() {
+
+	flag.StringVar(&ifname, "i", "lo", "iface")
+	var configFile string
+	flag.StringVar(&configFile, "config", "configs/backends_lc.json", "config")
+	flag.Parse()
+
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var cfg Config
+	json.Unmarshal(data, &cfg)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	rlimit.RemoveMemlock()
+
+	var objs lb2Objects
+	loadLb2Objects(&objs, nil)
+	defer objs.Close()
+
+	addService(&objs, cfg.Service.VIP, cfg.Service.Port)
+
+	for i, backend := range cfg.Backends {
+
+		backIP, _ := parseIPv4(backend.IP)
+
+		backEp := lb2Backend{
+			Ip:    backIP,
+			Port:  htons(backend.Port),
+			Conns: 0,
+		}
+
+		objs.lb2Maps.Backends.Put(uint32(i), &backEp)
+	}
+
+	count := uint32(len(cfg.Backends))
+	key := uint32(0)
+	objs.lb2Maps.BackendCount.Put(key, count)
+
+	iface, _ := net.InterfaceByName(ifname)
+
+	xdplink, err := link.AttachXDP(link.XDPOptions{
+		Program:   objs.XdpLoadBalancer,
+		Interface: iface.Index,
+		Flags:     link.XDPGenericMode,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer xdplink.Close()
+
+	log.Println("XDP LB running")
+
+	reader := bufio.NewReader(os.Stdin)
+
+	go func() {
+
+		for {
+
+			select {
+			case <-ctx.Done():
+				return
+			default:
+
+				fmt.Print("lb> ")
+				line, _ := reader.ReadString('\n')
+
+				parts := strings.Fields(strings.TrimSpace(line))
+				if len(parts) == 0 {
+					continue
+				}
+
+				switch parts[0] {
+
+				case "add":
+					p, _ := strconv.Atoi(parts[2])
+					addBackend(&objs, parts[1], uint16(p))
+
+				case "del":
+					p, _ := strconv.Atoi(parts[2])
+					deleteBackend(&objs, parts[1], uint16(p))
+
+				case "list":
+					listBackends(&objs)
+
+				case "addsvc":
+					p, _ := strconv.Atoi(parts[2])
+					addService(&objs, parts[1], uint16(p))
+
+				case "delsvc":
+					p, _ := strconv.Atoi(parts[2])
+					deleteService(&objs, parts[1], uint16(p))
+
+				case "listsvc":
+					listServices(&objs)
+
+				default:
+					fmt.Println("add del list addsvc delsvc listsvc")
+				}
+			}
+		}
+	}()
+
+	<-ctx.Done()
+}
