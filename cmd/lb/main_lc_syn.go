@@ -1,7 +1,7 @@
 //go:build lc_syn
 package main
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpf lb2 ../../bpf/lb_lc_syn.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpf lb ../../bpf/lb_lc_syn.c
 
 import (
 	"bufio"
@@ -52,7 +52,7 @@ func htons(port uint16) uint16 {
 	return (port<<8)&0xff00 | port>>8
 }
 
-func addService(objs *lb2Objects, ip string, port uint16) {
+func addService(objs *lbObjects, ip string, port uint16) {
 
 	vip, err := parseIPv4(ip)
 	if err != nil {
@@ -60,14 +60,14 @@ func addService(objs *lb2Objects, ip string, port uint16) {
 		return
 	}
 
-	key := lb2Service{
-		Vip:  vip,
+	key := lbIpPort{
+		Ip:   vip,
 		Port: htons(port),
 	}
 
 	val := true
 
-	err = objs.lb2Maps.Services.Put(&key, &val)
+	err = objs.lbMaps.Services.Put(&key, &val)
 	if err != nil {
 		log.Println("failed adding service:", err)
 		return
@@ -76,7 +76,7 @@ func addService(objs *lb2Objects, ip string, port uint16) {
 	log.Println("service added:", ip, port)
 }
 
-func deleteService(objs *lb2Objects, ip string, port uint16) {
+func deleteService(objs *lbObjects, ip string, port uint16) {
 
 	vip, err := parseIPv4(ip)
 	if err != nil {
@@ -84,12 +84,12 @@ func deleteService(objs *lb2Objects, ip string, port uint16) {
 		return
 	}
 
-	key := lb2Service{
-		Vip:  vip,
+	key := lbIpPort{
+		Ip:   vip,
 		Port: htons(port),
 	}
 
-	err = objs.lb2Maps.Services.Delete(&key)
+	err = objs.lbMaps.Services.Delete(&key)
 	if err != nil {
 		log.Println("failed deleting service:", err)
 		return
@@ -98,23 +98,23 @@ func deleteService(objs *lb2Objects, ip string, port uint16) {
 	log.Println("service deleted:", ip, port)
 }
 
-func listServices(objs *lb2Objects) {
+func listServices(objs *lbObjects) {
 
-	iter := objs.lb2Maps.Services.Iterate()
+	iter := objs.lbMaps.Services.Iterate()
 
-	var k lb2Service
+	var k lbIpPort
 	var v bool
 
 	for iter.Next(&k, &v) {
 
 		ip := make(net.IP, 4)
-		binary.LittleEndian.PutUint32(ip, k.Vip)
+		binary.LittleEndian.PutUint32(ip, k.Ip)
 
 		fmt.Println("service:", ip, "port:", htons(k.Port))
 	}
 }
 
-func addBackend(objs *lb2Objects, ip string, port uint16) {
+func addBackend(objs *lbObjects, ip string, port uint16) {
 
 	backIP, err := parseIPv4(ip)
 	if err != nil {
@@ -125,40 +125,40 @@ func addBackend(objs *lb2Objects, ip string, port uint16) {
 	key := uint32(0)
 	var count uint32
 
-	err = objs.lb2Maps.BackendCount.Lookup(key, &count)
+	err = objs.lbMaps.BackendCount.Lookup(key, &count)
 	if err != nil {
 		log.Println("failed reading backend count:", err)
 		return
 	}
 
 	for i := uint32(0); i < count; i++ {
-		var b lb2Backend
-		err := objs.lb2Maps.Backends.Lookup(i, &b)
+		var b lbBackend
+		err := objs.lbMaps.Backends.Lookup(i, &b)
 		if err == nil && b.Ip == backIP && b.Port == htons(port) {
 			log.Println("backend already exists:", ip, port)
 			return
 		}
 	}
 
-	backEp := lb2Backend{
+	backEp := lbBackend{
 		Ip:    backIP,
 		Port:  htons(port),
 		Conns: 0,
 	}
 
-	err = objs.lb2Maps.Backends.Put(count, &backEp)
+	err = objs.lbMaps.Backends.Put(count, &backEp)
 	if err != nil {
 		log.Println("failed adding backend:", err)
 		return
 	}
 
 	count++
-	objs.lb2Maps.BackendCount.Put(key, count)
+	objs.lbMaps.BackendCount.Put(key, count)
 
 	log.Println("backend added:", ip, port)
 }
 
-func deleteBackend(objs *lb2Objects, ip string, port uint16) {
+func deleteBackend(objs *lbObjects, ip string, port uint16) {
 
 	backIP, err := parseIPv4(ip)
 	if err != nil {
@@ -169,7 +169,7 @@ func deleteBackend(objs *lb2Objects, ip string, port uint16) {
 	key := uint32(0)
 	var count uint32
 
-	err = objs.lb2Maps.BackendCount.Lookup(key, &count)
+	err = objs.lbMaps.BackendCount.Lookup(key, &count)
 	if err != nil {
 		log.Println("failed reading backend count:", err)
 		return
@@ -177,8 +177,8 @@ func deleteBackend(objs *lb2Objects, ip string, port uint16) {
 
 	for i := uint32(0); i < count; i++ {
 
-		var b lb2Backend
-		err := objs.lb2Maps.Backends.Lookup(i, &b)
+		var b lbBackend
+		err := objs.lbMaps.Backends.Lookup(i, &b)
 		if err != nil {
 			continue
 		}
@@ -193,17 +193,17 @@ func deleteBackend(objs *lb2Objects, ip string, port uint16) {
 			last := count - 1
 
 			if i != last {
-				var lastBackend lb2Backend
-				err := objs.lb2Maps.Backends.Lookup(last, &lastBackend)
+				var lastBackend lbBackend
+				err := objs.lbMaps.Backends.Lookup(last, &lastBackend)
 				if err == nil {
-					objs.lb2Maps.Backends.Put(i, &lastBackend)
+					objs.lbMaps.Backends.Put(i, &lastBackend)
 				}
 			}
 
-			objs.lb2Maps.Backends.Delete(last)
+			objs.lbMaps.Backends.Delete(last)
 
 			count--
-			objs.lb2Maps.BackendCount.Put(key, count)
+			objs.lbMaps.BackendCount.Put(key, count)
 
 			log.Println("backend deleted:", ip, port)
 			return
@@ -213,12 +213,12 @@ func deleteBackend(objs *lb2Objects, ip string, port uint16) {
 	log.Println("backend not found:", ip, port)
 }
 
-func listBackends(objs *lb2Objects) {
+func listBackends(objs *lbObjects) {
 
 	var count uint32
 	key := uint32(0)
 
-	err := objs.lb2Maps.BackendCount.Lookup(key, &count)
+	err := objs.lbMaps.BackendCount.Lookup(key, &count)
 	if err != nil {
 		fmt.Println("failed to read backend count")
 		return
@@ -226,8 +226,8 @@ func listBackends(objs *lb2Objects) {
 
 	for i := uint32(0); i < count; i++ {
 
-		var b lb2Backend
-		err := objs.lb2Maps.Backends.Lookup(i, &b)
+		var b lbBackend
+		err := objs.lbMaps.Backends.Lookup(i, &b)
 		if err != nil {
 			continue
 		}
@@ -259,8 +259,10 @@ func main() {
 
 	rlimit.RemoveMemlock()
 
-	var objs lb2Objects
-	loadLb2Objects(&objs, nil)
+	var objs lbObjects
+	if err := loadLbObjects(&objs, nil); err != nil {
+		log.Fatalf("loading BPF objects: %v", err)
+	}
 	defer objs.Close()
 
 	addService(&objs, cfg.Service.VIP, cfg.Service.Port)
@@ -269,18 +271,18 @@ func main() {
 
 		backIP, _ := parseIPv4(backend.IP)
 
-		backEp := lb2Backend{
+		backEp := lbBackend{
 			Ip:    backIP,
 			Port:  htons(backend.Port),
 			Conns: 0,
 		}
 
-		objs.lb2Maps.Backends.Put(uint32(i), &backEp)
+		objs.lbMaps.Backends.Put(uint32(i), &backEp)
 	}
 
 	count := uint32(len(cfg.Backends))
 	key := uint32(0)
-	objs.lb2Maps.BackendCount.Put(key, count)
+	objs.lbMaps.BackendCount.Put(key, count)
 
 	iface, _ := net.InterfaceByName(ifname)
 

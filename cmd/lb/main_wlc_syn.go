@@ -4,27 +4,28 @@ package main
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpf lb4 ../../bpf/lb_wlc_syn.c
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/rlimit"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
-	"bufio"
-	"strconv"
-
-	"github.com/cilium/ebpf/link"
-	"github.com/cilium/ebpf/rlimit"
 )
 
-var ifname string
+var (
+	ifname string
+)
 
-type BackendConfig struct {
+type BackendEntry struct {
 	IP     string `json:"ip"`
 	Port   uint16 `json:"port"`
 	Weight uint16 `json:"weight"`
@@ -36,8 +37,8 @@ type ServiceEntry struct {
 }
 
 type Config struct {
-	Service  ServiceEntry    `json:"service"`
-	Backends []BackendConfig `json:"backends"`
+	Service  ServiceEntry   `json:"service"`
+	Backends []BackendEntry `json:"backends"`
 }
 
 func parseIPv4(s string) (uint32, error) {
@@ -49,7 +50,7 @@ func parseIPv4(s string) (uint32, error) {
 }
 
 func htons(port uint16) uint16 {
-	return (port << 8) | (port >> 8)
+	return (port<<8)&0xff00 | port>>8
 }
 
 func addService(objs *lb4Objects, ip string, port uint16) {
@@ -60,8 +61,8 @@ func addService(objs *lb4Objects, ip string, port uint16) {
 		return
 	}
 
-	key := lb4Service{
-		Vip:  vip,
+	key := lb4IpPort{
+		Ip:   vip,
 		Port: htons(port),
 	}
 
@@ -84,8 +85,8 @@ func deleteService(objs *lb4Objects, ip string, port uint16) {
 		return
 	}
 
-	key := lb4Service{
-		Vip:  vip,
+	key := lb4IpPort{
+		Ip:   vip,
 		Port: htons(port),
 	}
 
@@ -102,13 +103,13 @@ func listServices(objs *lb4Objects) {
 
 	iter := objs.lb4Maps.Services.Iterate()
 
-	var k lb4Service
+	var k lb4IpPort
 	var v bool
 
 	for iter.Next(&k, &v) {
 
 		ip := make(net.IP, 4)
-		binary.LittleEndian.PutUint32(ip, k.Vip)
+		binary.LittleEndian.PutUint32(ip, k.Ip)
 
 		fmt.Println("service:", ip, "port:", htons(k.Port))
 	}
@@ -125,10 +126,13 @@ func addBackend(objs *lb4Objects, ip string, port uint16, weight uint16) {
 	key := uint32(0)
 	var count uint32
 
-	objs.lb4Maps.BackendCount.Lookup(key, &count)
+	err = objs.lb4Maps.BackendCount.Lookup(key, &count)
+	if err != nil {
+		log.Println("failed reading backend count:", err)
+		return
+	}
 
 	for i := uint32(0); i < count; i++ {
-
 		var b lb4Backend
 		err := objs.lb4Maps.Backends.Lookup(i, &b)
 		if err == nil && b.Ip == backIP && b.Port == htons(port) {
@@ -144,61 +148,16 @@ func addBackend(objs *lb4Objects, ip string, port uint16, weight uint16) {
 		Weight: weight,
 	}
 
-	objs.lb4Maps.Backends.Put(count, &backEp)
+	err = objs.lb4Maps.Backends.Put(count, &backEp)
+	if err != nil {
+		log.Println("failed adding backend:", err)
+		return
+	}
 
 	count++
 	objs.lb4Maps.BackendCount.Put(key, count)
 
 	log.Println("backend added:", ip, port)
-}
-
-func deleteBackend(objs *lb4Objects, ip string, port uint16) {
-
-	backIP, err := parseIPv4(ip)
-	if err != nil {
-		log.Println("invalid ip:", err)
-		return
-	}
-
-	key := uint32(0)
-	var count uint32
-
-	objs.lb4Maps.BackendCount.Lookup(key, &count)
-
-	for i := uint32(0); i < count; i++ {
-
-		var b lb4Backend
-		err := objs.lb4Maps.Backends.Lookup(i, &b)
-		if err != nil {
-			continue
-		}
-
-		if b.Ip == backIP && b.Port == htons(port) {
-
-			if b.Conns != 0 {
-				log.Println("cannot delete backend, active connections:", b.Conns)
-				return
-			}
-
-			last := count - 1
-
-			if i != last {
-				var lastBackend lb4Backend
-				objs.lb4Maps.Backends.Lookup(last, &lastBackend)
-				objs.lb4Maps.Backends.Put(i, &lastBackend)
-			}
-
-			objs.lb4Maps.Backends.Delete(last)
-
-			count--
-			objs.lb4Maps.BackendCount.Put(key, count)
-
-			log.Println("backend deleted:", ip, port)
-			return
-		}
-	}
-
-	log.Println("backend not found:", ip, port)
 }
 
 func updateBackend(objs *lb4Objects, ip string, port uint16, weight uint16) {
@@ -212,7 +171,11 @@ func updateBackend(objs *lb4Objects, ip string, port uint16, weight uint16) {
 	key := uint32(0)
 	var count uint32
 
-	objs.lb4Maps.BackendCount.Lookup(key, &count)
+	err = objs.lb4Maps.BackendCount.Lookup(key, &count)
+	if err != nil {
+		log.Println("failed reading backend count:", err)
+		return
+	}
 
 	for i := uint32(0); i < count; i++ {
 
@@ -235,12 +198,71 @@ func updateBackend(objs *lb4Objects, ip string, port uint16, weight uint16) {
 	log.Println("backend not found:", ip, port)
 }
 
+func deleteBackend(objs *lb4Objects, ip string, port uint16) {
+
+	backIP, err := parseIPv4(ip)
+	if err != nil {
+		log.Println("invalid ip:", err)
+		return
+	}
+
+	key := uint32(0)
+	var count uint32
+
+	err = objs.lb4Maps.BackendCount.Lookup(key, &count)
+	if err != nil {
+		log.Println("failed reading backend count:", err)
+		return
+	}
+
+	for i := uint32(0); i < count; i++ {
+
+		var b lb4Backend
+		err := objs.lb4Maps.Backends.Lookup(i, &b)
+		if err != nil {
+			continue
+		}
+
+		if b.Ip == backIP && b.Port == htons(port) {
+
+			if b.Conns != 0 {
+				log.Println("cannot delete backend, active connections:", b.Conns)
+				return
+			}
+
+			last := count - 1
+
+			if i != last {
+				var lastBackend lb4Backend
+				err := objs.lb4Maps.Backends.Lookup(last, &lastBackend)
+				if err == nil {
+					objs.lb4Maps.Backends.Put(i, &lastBackend)
+				}
+			}
+
+			objs.lb4Maps.Backends.Delete(last)
+
+			count--
+			objs.lb4Maps.BackendCount.Put(key, count)
+
+			log.Println("backend deleted:", ip, port)
+			return
+		}
+	}
+
+	log.Println("backend not found:", ip, port)
+}
+
 func listBackends(objs *lb4Objects) {
 
 	var count uint32
 	key := uint32(0)
 
-	objs.lb4Maps.BackendCount.Lookup(key, &count)
+	err := objs.lb4Maps.BackendCount.Lookup(key, &count)
+	if err != nil {
+		fmt.Println("failed to read backend count")
+		return
+	}
 
 	for i := uint32(0); i < count; i++ {
 
@@ -259,13 +281,15 @@ func listBackends(objs *lb4Objects) {
 
 func main() {
 
-	flag.StringVar(&ifname, "i", "lo", "Network interface")
-
+	flag.StringVar(&ifname, "i", "lo", "iface")
 	var configFile string
-	flag.StringVar(&configFile, "config", "configs/backends_wlc.json", "Backend configuration")
+	flag.StringVar(&configFile, "config", "configs/backends_wlc.json", "config")
 	flag.Parse()
 
-	data, _ := os.ReadFile(configFile)
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	var cfg Config
 	json.Unmarshal(data, &cfg)
@@ -276,40 +300,49 @@ func main() {
 	rlimit.RemoveMemlock()
 
 	var objs lb4Objects
-	loadLb4Objects(&objs, nil)
+	if err := loadLb4Objects(&objs, nil); err != nil {
+		log.Fatalf("loading BPF objects: %v", err)
+	}
 	defer objs.Close()
 
 	addService(&objs, cfg.Service.VIP, cfg.Service.Port)
 
-	for i, be := range cfg.Backends {
+	for i, backend := range cfg.Backends {
 
-		ip, _ := parseIPv4(be.IP)
+		backIP, _ := parseIPv4(backend.IP)
 
 		backEp := lb4Backend{
-			Ip:     ip,
-			Port:   htons(be.Port),
+			Ip:     backIP,
+			Port:   htons(backend.Port),
 			Conns:  0,
-			Weight: be.Weight,
+			Weight: backend.Weight,
 		}
 
 		objs.lb4Maps.Backends.Put(uint32(i), &backEp)
 	}
 
+	count := uint32(len(cfg.Backends))
 	key := uint32(0)
-	objs.lb4Maps.BackendCount.Put(key, uint32(len(cfg.Backends)))
+	objs.lb4Maps.BackendCount.Put(key, count)
 
 	iface, _ := net.InterfaceByName(ifname)
 
-	xdplink, _ := link.AttachXDP(link.XDPOptions{
+	xdplink, err := link.AttachXDP(link.XDPOptions{
 		Program:   objs.XdpLoadBalancer,
 		Interface: iface.Index,
 		Flags:     link.XDPGenericMode,
 	})
+	if err != nil {
+		log.Fatal(err)
+	}
 	defer xdplink.Close()
+
+	log.Println("XDP LB running")
 
 	reader := bufio.NewReader(os.Stdin)
 
 	go func() {
+
 		for {
 
 			select {
@@ -319,8 +352,8 @@ func main() {
 
 				fmt.Print("lb> ")
 				line, _ := reader.ReadString('\n')
-				parts := strings.Fields(strings.TrimSpace(line))
 
+				parts := strings.Fields(strings.TrimSpace(line))
 				if len(parts) == 0 {
 					continue
 				}
@@ -332,14 +365,14 @@ func main() {
 					w, _ := strconv.Atoi(parts[3])
 					addBackend(&objs, parts[1], uint16(p), uint16(w))
 
-				case "del":
-					p, _ := strconv.Atoi(parts[2])
-					deleteBackend(&objs, parts[1], uint16(p))
-
 				case "update":
 					p, _ := strconv.Atoi(parts[2])
 					w, _ := strconv.Atoi(parts[3])
 					updateBackend(&objs, parts[1], uint16(p), uint16(w))
+
+				case "del":
+					p, _ := strconv.Atoi(parts[2])
+					deleteBackend(&objs, parts[1], uint16(p))
 
 				case "list":
 					listBackends(&objs)
@@ -354,6 +387,9 @@ func main() {
 
 				case "listsvc":
 					listServices(&objs)
+
+				default:
+					fmt.Println("add del update list addsvc delsvc listsvc")
 				}
 			}
 		}

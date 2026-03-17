@@ -41,11 +41,11 @@ type Config struct {
 }
 
 func parseIPv4(s string) (uint32, error) {
-	ip := net.ParseIP(s).To4()
-	if ip == nil {
-		return 0, fmt.Errorf("invalid IPv4: %s", s)
-	}
-	return binary.LittleEndian.Uint32(ip), nil
+    ip := net.ParseIP(s).To4()
+    if ip == nil {
+        return 0, fmt.Errorf("invalid IPv4: %s", s)
+    }
+    return binary.LittleEndian.Uint32(ip), nil
 }
 
 func htons(port uint16) uint16 {
@@ -60,8 +60,8 @@ func addService(objs *lbObjects, ip string, port uint16) {
 		return
 	}
 
-	key := lbService{
-		Vip:  vip,
+	key := lbIpPort{
+		Ip:   vip,
 		Port: htons(port),
 	}
 
@@ -84,8 +84,8 @@ func deleteService(objs *lbObjects, ip string, port uint16) {
 		return
 	}
 
-	key := lbService{
-		Vip:  vip,
+	key := lbIpPort{
+		Ip:   vip,
 		Port: htons(port),
 	}
 
@@ -102,13 +102,13 @@ func listServices(objs *lbObjects) {
 
 	iter := objs.lbMaps.Services.Iterate()
 
-	var k lbService
+	var k lbIpPort
 	var v bool
 
 	for iter.Next(&k, &v) {
 
 		ip := make(net.IP, 4)
-		binary.LittleEndian.PutUint32(ip, k.Vip)
+		binary.LittleEndian.PutUint32(ip, k.Ip)
 
 		fmt.Println("service:", ip, "port:", htons(k.Port))
 	}
@@ -260,7 +260,9 @@ func main() {
 	rlimit.RemoveMemlock()
 
 	var objs lbObjects
-	loadLbObjects(&objs, nil)
+	if err := loadLbObjects(&objs, nil); err != nil {
+    	log.Fatalf("loading BPF objects: %v", err)
+	}
 	defer objs.Close()
 
 	addService(&objs, cfg.Service.VIP, cfg.Service.Port)
