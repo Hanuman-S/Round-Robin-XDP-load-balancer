@@ -303,6 +303,17 @@ func main() {
 	if err := loadLb4Objects(&objs, nil); err != nil {
 		log.Fatalf("loading BPF objects: %v", err)
 	}
+
+	const maxPort = 61024
+	const startPort = 1024
+
+	for p := startPort; p < maxPort; p++ {
+    	port := uint16(p)
+    	err := objs.lb4Maps.FreePorts.Update(nil, &port, 0)
+    	if err != nil {
+    	    log.Fatalf("failed to init free port %d: %v", p, err)
+    	}
+	}
 	defer objs.Close()
 
 	addService(&objs, cfg.Service.VIP, cfg.Service.Port)

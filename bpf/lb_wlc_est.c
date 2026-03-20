@@ -4,8 +4,8 @@
 #include <bpf/bpf_helpers.h>
 #include "parse_helpers.h"
 
-#define MAX_CONNECTIONS 1000
-#define MAX_PORTS 2024
+#define MAX_CONNECTIONS 60000
+#define MAX_PORT 61024
 #define MAX_BACKENDS 100
 #define MAX_SERVICES 10
 #define ETH_ALEN 6
@@ -90,10 +90,18 @@ struct
 struct
 {
   __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, MAX_PORTS);
+  __uint(max_entries, MAX_PORT);
   __type(key, struct ip_port);   // from client perspective
   __type(value, struct ip_port); // translated client port (unique)
 } port_ownership SEC(".maps");
+
+// manage the available ports for source port translation
+struct
+{
+  __uint(type, BPF_MAP_TYPE_QUEUE);
+  __uint(max_entries, MAX_PORT);
+  __type(value, __u16);
+} free_ports SEC(".maps");
 
 // helpers
 
@@ -329,6 +337,10 @@ int xdp_load_balancer(struct xdp_md *ctx)
         nb.conns -= 1;
       bpf_map_update_elem(&backends, &ct->backend_idx, &nb, BPF_ANY);
 
+      // add port back to free pool
+      __u16 p = bpf_ntohs(ct_key_from_backend.port);
+      bpf_map_push_elem(&free_ports, &p, 0);
+
       // Delete port_ownership entry (key is client-facing direction)
       struct ip_port po_key = {
           .ip = ct->ip,
@@ -446,51 +458,38 @@ int xdp_load_balancer(struct xdp_md *ctx)
         return XDP_ABORTED;
       }
       // find available port for translation and insert into port_ownership map
-      for (__u16 p = 1024; p < MAX_PORTS; p++)
+      __u16 p;
+      long ret = bpf_map_pop_elem(&free_ports, &p);
+      if (ret < 0)
       {
-        struct ip_port candidate_key = {};
-        candidate_key.port = bpf_htons(p);
-        candidate_key.ip = b->ip;
-        struct conn_meta *existing = bpf_map_lookup_elem(&conntrack, &candidate_key);
-        if (!existing)
-        {
-          bpf_printk("selected %d", p);
-          // Found an available port
-          ct_key.ip = b->ip;
-          ct_key.port = bpf_htons(p);
-          ct_port = bpf_htons(p);
-
-          struct conn_meta meta = {};
-          meta.ip = ip->saddr;
-          meta.backend_idx = key;
-          meta.state = 0;
-          meta.port = tcp->source; // store original client source port for reply direction
-          meta.service_port = svc_key.port;
-
-          if (bpf_map_update_elem(&conntrack, &ct_key, &meta, BPF_ANY) != 0)
-          {
-            bpf_printk("ABORT_4 conntrack_insert_failed");
-            return XDP_ABORTED;
-          }
-
-          if (bpf_map_update_elem(&port_ownership, &po_key, &ct_key, BPF_ANY) != 0)
-          {
-            bpf_printk("ABORT_5 port_ownership_insert_failed");
-            return XDP_ABORTED;
-          }
-          ct = bpf_map_lookup_elem(&conntrack, &ct_key);
-          if (!ct)
-            return XDP_ABORTED;
-          found = true;
-          break;
-        }
-      }
-      if (!found)
-      {
-        bpf_printk("ABORT_6 no_available_port");
+        bpf_printk("NO_FREE_PORT");
         return XDP_ABORTED;
       }
 
+      ct_key.port = bpf_htons(p);
+      ct_port = bpf_htons(p);
+      ct_key.ip = b->ip;
+      ct_port = ct_key.port;
+
+      struct conn_meta meta = {};
+      meta.ip = ip->saddr;
+      meta.backend_idx = key;
+      meta.state = 0;
+      meta.port = tcp->source; // store original client source port for reply direction
+      meta.service_port = svc_key.port;
+
+      // Insert conntrack entry for the new connection
+      if (bpf_map_update_elem(&conntrack, &ct_key, &meta, BPF_ANY) != 0)
+      {
+        bpf_printk("ABORT_4 conntrack_insert_failed");
+        return XDP_ABORTED;
+      }
+      // Insert port_ownership entry to link client-facing five-tuple to conntrack entry
+      if (bpf_map_update_elem(&port_ownership, &po_key, &ct_key, BPF_ANY) != 0)
+      {
+        bpf_printk("ABORT_5 port_ownership_insert_failed");
+        return XDP_ABORTED;
+      }
       bpf_printk("New connection: Client %pI4:%d -> Backend %pI4",
                  &ip->saddr, bpf_ntohs(tcp->source), &b->ip);
     }
