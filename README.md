@@ -128,24 +128,42 @@ Both algorithms are available in two builds, differing only in *when* a connecti
 ## Repository Structure
 ```
 .
-├── bpf/                        # eBPF/XDP load balancer programs (C)
-│   ├── lb_lc_est.c             # LC, established-mode
-│   ├── lb_lc_syn.c             # LC, SYN-mode
-│   ├── lb_wlc_est.c            # WLC, established-mode
-│   └── lb_wlc_syn.c            # WLC, SYN-mode
+├── bin/                        # Built binaries (ignored in git)
+│   ├── lbctl                   # CLI tool
+│   ├── lbxdpd                  # Generic daemon (if used)
+│   ├── lbxdpd-lc               # LC daemon binary
+│   └── lbxdpd-wlc              # WLC daemon binary
+├── bpf/                        # eBPF/XDP programs (C source)
+│   ├── lb_lc_est.c             # Least Connections (established-mode)
+│   ├── lb_lc_syn.c             # Least Connections (SYN-mode)
+│   ├── lb_wlc_est.c            # Weighted LC (established-mode)
+│   ├── lb_wlc_syn.c            # Weighted LC (SYN-mode)
+│   ├── parse_helpers.h         # Packet parsing helpers
+│   └── vmlinux.h               # BTF header for CO-RE
 ├── cmd/
-│   ├── lbxdpd-lc/              # LC daemon (loads BPF, pins maps, gRPC control)
-│   ├── lbxdpd-wlc/             # WLC daemon (loads BPF, pins maps, gRPC control)
-│   └── lbctl/                  # CLI — talks to pinned maps and gRPC socket
+│   ├── lb/                     # Generated eBPF Go bindings (ignored)
+│   │   ├── *_bpf.go
+│   │   └── *_bpf.o
+│   ├── lbctl/                  # CLI — interacts with maps + gRPC
+│   │   ├── main.go
+│   │   └── mapmode.go
+│   └── lbxdpd/                 # Unified daemon (variant-based)
+│       ├── main.go
+│       ├── ports.go
+│       └── variants.go
 ├── configs/
-│   ├── backends_lc.json        # Initial service + backend config for LC
-│   └── backends_wlc.json       # Initial service + backend config for WLC (with weights)
+│   ├── backends_lc.json        # Backend config (LC)
+│   └── backends_wlc.json       # Backend config (WLC with weights)
 ├── proto/
-│   └── control.proto           # gRPC service definition
-└── scripts/
-    ├── build.sh                 # Builds all binaries
-    ├── gen.sh                   # Regenerates eBPF and protobuf bindings
-    └── llvm.sh                  # Installs LLVM toolchain dependencies
+│   ├── control.proto           # gRPC service definition
+│   └── *.pb.go                 # Generated protobuf bindings (ignored)
+├── scripts/
+│   ├── build.sh                # Build all binaries
+│   ├── gen.sh                  # Generate eBPF + protobuf bindings
+│   └── llvm.sh                 # Install LLVM/Clang dependencies
+├── go.mod
+├── go.sum
+└── README.md
 ```
 
 The system is split into three binaries:
