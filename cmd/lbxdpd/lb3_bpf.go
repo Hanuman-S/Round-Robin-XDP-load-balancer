@@ -16,8 +16,10 @@ type lb3Backend struct {
 	_      structs.HostLayout
 	Ip     uint32
 	Port   uint16
-	Weight uint16
+	_      [2]byte
 	Conns  uint32
+	Weight uint16
+	_      [2]byte
 }
 
 type lb3ConnMeta struct {
@@ -25,7 +27,7 @@ type lb3ConnMeta struct {
 	Ip          uint32
 	Port        uint16
 	_           [2]byte
-	BackendId   uint32
+	BackendIdx  uint32
 	State       uint8
 	_           [1]byte
 	ServicePort uint16
@@ -87,13 +89,12 @@ type lb3ProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type lb3MapSpecs struct {
-	BackendCount   *ebpf.MapSpec `ebpf:"backend_count"`
-	Backends       *ebpf.MapSpec `ebpf:"backends"`
-	Conntrack      *ebpf.MapSpec `ebpf:"conntrack"`
-	FreePorts      *ebpf.MapSpec `ebpf:"free_ports"`
-	PortOwnership  *ebpf.MapSpec `ebpf:"port_ownership"`
-	SelectionArray *ebpf.MapSpec `ebpf:"selection_array"`
-	Services       *ebpf.MapSpec `ebpf:"services"`
+	BackendCount  *ebpf.MapSpec `ebpf:"backend_count"`
+	Backends      *ebpf.MapSpec `ebpf:"backends"`
+	Conntrack     *ebpf.MapSpec `ebpf:"conntrack"`
+	FreePorts     *ebpf.MapSpec `ebpf:"free_ports"`
+	PortOwnership *ebpf.MapSpec `ebpf:"port_ownership"`
+	Services      *ebpf.MapSpec `ebpf:"services"`
 }
 
 // lb3VariableSpecs contains global variables before they are loaded into the kernel.
@@ -122,13 +123,12 @@ func (o *lb3Objects) Close() error {
 //
 // It can be passed to loadLb3Objects or ebpf.CollectionSpec.LoadAndAssign.
 type lb3Maps struct {
-	BackendCount   *ebpf.Map `ebpf:"backend_count"`
-	Backends       *ebpf.Map `ebpf:"backends"`
-	Conntrack      *ebpf.Map `ebpf:"conntrack"`
-	FreePorts      *ebpf.Map `ebpf:"free_ports"`
-	PortOwnership  *ebpf.Map `ebpf:"port_ownership"`
-	SelectionArray *ebpf.Map `ebpf:"selection_array"`
-	Services       *ebpf.Map `ebpf:"services"`
+	BackendCount  *ebpf.Map `ebpf:"backend_count"`
+	Backends      *ebpf.Map `ebpf:"backends"`
+	Conntrack     *ebpf.Map `ebpf:"conntrack"`
+	FreePorts     *ebpf.Map `ebpf:"free_ports"`
+	PortOwnership *ebpf.Map `ebpf:"port_ownership"`
+	Services      *ebpf.Map `ebpf:"services"`
 }
 
 func (m *lb3Maps) Close() error {
@@ -138,7 +138,6 @@ func (m *lb3Maps) Close() error {
 		m.Conntrack,
 		m.FreePorts,
 		m.PortOwnership,
-		m.SelectionArray,
 		m.Services,
 	)
 }

@@ -53,10 +53,6 @@ const (
 	sentinelPath = "/run/lbxdp.mode"
 )
 
-// nextBackendID is the process-wide stable ID counter used by wlc variants.
-// Starts at 1 — 0 is reserved as an invalid/sentinel value in BPF.
-var nextBackendID uint32 = 1
-
 func pinMaps(pins map[string]*ebpf.Map, modeName string) error {
 	if err := os.MkdirAll(pinDir, 0755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", pinDir, err)
@@ -81,10 +77,79 @@ func loadConfig(cfgPath string) (config, error) {
 	return cfg, nil
 }
 
-// ── LC shared map helpers (backends is BPF_MAP_TYPE_ARRAY) ───────────────────
+// patchConntrackLb3 scans the lb3 conntrack map and rewrites every entry
+// whose BackendIdx == oldIdx to newIdx. Called after a swap-delete so
+// existing connections keep pointing at the correct backend slot.
+func patchConntrackLb3(conntrack *ebpf.Map, oldIdx, newIdx uint32) error {
+	type kv struct {
+		key lb3IpPort
+		val lb3ConnMeta
+	}
+	var patches []kv
+	iter := conntrack.Iterate()
+	var k lb3IpPort
+	var v lb3ConnMeta
+	for iter.Next(&k, &v) {
+		if v.BackendIdx == oldIdx {
+			v.BackendIdx = newIdx
+			patches = append(patches, kv{k, v})
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("iterate conntrack: %w", err)
+	}
+	for _, p := range patches {
+		pk, pv := p.key, p.val
+		if err := conntrack.Update(&pk, &pv, ebpf.UpdateExist); err != nil {
+			return fmt.Errorf("patch conntrack entry: %w", err)
+		}
+	}
+	return nil
+}
 
-func lcAddBackend(backends, countMap *ebpf.Map, ip string, port uint16,
-	makeEntry func(ip uint32, port uint16) interface{}) error {
+// patchConntrackLb4 is identical to patchConntrackLb3 but uses lb4 types.
+func patchConntrackLb4(conntrack *ebpf.Map, oldIdx, newIdx uint32) error {
+	type kv struct {
+		key lb4IpPort
+		val lb4ConnMeta
+	}
+	var patches []kv
+	iter := conntrack.Iterate()
+	var k lb4IpPort
+	var v lb4ConnMeta
+	for iter.Next(&k, &v) {
+		if v.BackendId == oldIdx {
+			v.BackendId = newIdx
+			patches = append(patches, kv{k, v})
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("iterate conntrack: %w", err)
+	}
+	for _, p := range patches {
+		pk, pv := p.key, p.val
+		if err := conntrack.Update(&pk, &pv, ebpf.UpdateExist); err != nil {
+			return fmt.Errorf("patch conntrack entry: %w", err)
+		}
+	}
+	return nil
+}
+
+// ── generic array-backend helpers (used by both lc and wlc) ──────────────────
+
+type (
+	makeEntryFn   func(ip uint32, port, weight uint16) interface{}
+	getIPPortFn   func(m *ebpf.Map, idx uint32) (ip uint32, port uint16, err error)
+	getConnsFn    func(m *ebpf.Map, idx uint32) (conns uint32, err error)
+	swapEntryFn   func(m *ebpf.Map, dst, src uint32) error
+	zeroEntryFn   func() interface{}
+)
+
+func arrayAddBackend(backends, countMap *ebpf.Map,
+	ip string, port, weight uint16,
+	getIPPort getIPPortFn,
+	make makeEntryFn,
+	portXform func(uint16) uint16) error {
 
 	pip, err := parseIPv4Cfg(ip)
 	if err != nil {
@@ -94,23 +159,18 @@ func lcAddBackend(backends, countMap *ebpf.Map, ip string, port uint16,
 	if err := countMap.Lookup(uint32(0), &count); err != nil {
 		return fmt.Errorf("lookup count: %w", err)
 	}
+	storedPort := portXform(port)
 	// Duplicate check.
-	type raw struct {
-		Ip    uint32
-		Port  uint16
-		_     uint16
-		Conns uint32
-	}
 	for i := uint32(0); i < count; i++ {
-		var b raw
-		if err := backends.Lookup(i, &b); err != nil {
+		bip, bport, err := getIPPort(backends, i)
+		if err != nil {
 			continue
 		}
-		if b.Ip == pip && b.Port == htons(port) {
+		if bip == pip && bport == storedPort {
 			return fmt.Errorf("backend %s:%d already exists", ip, port)
 		}
 	}
-	be := makeEntry(pip, htons(port))
+	be := make(pip, storedPort, weight)
 	if err := backends.Update(count, be, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("insert backend: %w", err)
 	}
@@ -121,11 +181,19 @@ func lcAddBackend(backends, countMap *ebpf.Map, ip string, port uint16,
 	return nil
 }
 
-func lcDeleteBackend(backends, countMap *ebpf.Map, ip string, port uint16,
-	zeroEntry func() interface{},
-	swapEntry func(m *ebpf.Map, dst, src uint32) error,
-	getConns func(m *ebpf.Map, idx uint32) (uint32, error),
-	getIPPort func(m *ebpf.Map, idx uint32) (uint32, uint16, error)) error {
+// arrayDeleteBackend performs a swap-delete on the dense backends array and
+// patches the conntrack map so existing connections keep working.
+// patchCT is called with (oldIdx=last, newIdx=deletedSlot) after the swap;
+// pass nil for lc variants which share conntrack with the kernel but don't
+// need patching (lc uses the same index scheme and has no weighted routing).
+func arrayDeleteBackend(backends, countMap *ebpf.Map,
+	ip string, port uint16,
+	getIPPort getIPPortFn,
+	getConns getConnsFn,
+	swap swapEntryFn,
+	zero zeroEntryFn,
+	portXform func(uint16) uint16,
+	patchCT func(oldIdx, newIdx uint32) error) error {
 
 	pip, err := parseIPv4Cfg(ip)
 	if err != nil {
@@ -135,12 +203,14 @@ func lcDeleteBackend(backends, countMap *ebpf.Map, ip string, port uint16,
 	if err := countMap.Lookup(uint32(0), &count); err != nil {
 		return fmt.Errorf("lookup count: %w", err)
 	}
+	storedPort := portXform(port)
+
 	for i := uint32(0); i < count; i++ {
 		bip, bport, err := getIPPort(backends, i)
 		if err != nil {
 			continue
 		}
-		if bip != pip || bport != htons(port) {
+		if bip != pip || bport != storedPort {
 			continue
 		}
 		conns, err := getConns(backends, i)
@@ -150,167 +220,24 @@ func lcDeleteBackend(backends, countMap *ebpf.Map, ip string, port uint16,
 		if conns != 0 {
 			return fmt.Errorf("backend %s:%d has %d active connections", ip, port, conns)
 		}
+
 		last := count - 1
 		if i != last {
-			if err := swapEntry(backends, i, last); err != nil {
+			// Swap last backend into the deleted slot.
+			if err := swap(backends, i, last); err != nil {
 				return fmt.Errorf("swap: %w", err)
 			}
+			// Patch conntrack: every entry pointing at 'last' must now point at 'i'.
+			if patchCT != nil {
+				if err := patchCT(last, i); err != nil {
+					return fmt.Errorf("patch conntrack: %w", err)
+				}
+			}
 		}
-		if err := backends.Update(last, zeroEntry(), ebpf.UpdateExist); err != nil {
+
+		// Zero the vacated last slot.
+		if err := backends.Update(last, zero(), ebpf.UpdateExist); err != nil {
 			return fmt.Errorf("zero last slot: %w", err)
-		}
-		count--
-		if err := countMap.Update(uint32(0), &count, ebpf.UpdateExist); err != nil {
-			return fmt.Errorf("update count: %w", err)
-		}
-		return nil
-	}
-	return fmt.Errorf("backend %s:%d not found", ip, port)
-}
-
-// ── WLC shared map helpers (backends is BPF_MAP_TYPE_HASH + selection_array) ─
-
-type (
-	lookupIPPortFn func(m *ebpf.Map, id uint32) (ip uint32, port uint16, err error)
-	lookupConnsFn  func(m *ebpf.Map, id uint32) (conns uint32, err error)
-	makeFn         func(ip uint32, port, weight uint16) interface{}
-)
-
-func wlcUpdateWeight(backends, countMap, selectionArray *ebpf.Map,
-	ip string, port, weight uint16) error {
-
-	pip, err := parseIPv4Cfg(ip)
-	if err != nil {
-		return err
-	}
-	var count uint32
-	if err := countMap.Lookup(uint32(0), &count); err != nil {
-		return fmt.Errorf("lookup count: %w", err)
-	}
-	type raw struct {
-		Ip     uint32
-		Port   uint16
-		Weight uint16
-		Conns  uint32
-	}
-	for i := uint32(0); i < count; i++ {
-		var id uint32
-		if err := selectionArray.Lookup(i, &id); err != nil {
-			continue
-		}
-		var b raw
-		if err := backends.Lookup(&id, &b); err != nil {
-			continue
-		}
-		if b.Ip == pip && b.Port == htons(port) {
-			b.Weight = weight
-			if err := backends.Update(&id, &b, ebpf.UpdateExist); err != nil {
-				return fmt.Errorf("update weight: %w", err)
-			}
-			return nil
-		}
-	}
-	return fmt.Errorf("backend %s:%d not found", ip, port)
-}
-
-func wlcAddBackend(backends, countMap, selectionArray *ebpf.Map,
-	ip string, port, weight uint16, make makeFn) error {
-
-	pip, err := parseIPv4Cfg(ip)
-	if err != nil {
-		return err
-	}
-	if weight == 0 {
-		weight = 1
-	}
-	var count uint32
-	if err := countMap.Lookup(uint32(0), &count); err != nil {
-		return fmt.Errorf("lookup count: %w", err)
-	}
-	// Duplicate check via selection_array.
-	type raw struct {
-		Ip     uint32
-		Port   uint16
-		Weight uint16
-		Conns  uint32
-	}
-	for i := uint32(0); i < count; i++ {
-		var id uint32
-		if err := selectionArray.Lookup(i, &id); err != nil {
-			continue
-		}
-		var b raw
-		if err := backends.Lookup(&id, &b); err != nil {
-			continue
-		}
-		if b.Ip == pip && b.Port == htons(port) {
-			return fmt.Errorf("backend %s:%d already exists", ip, port)
-		}
-	}
-	// Assign a new stable ID.
-	id := nextBackendID
-	nextBackendID++
-	be := make(pip, htons(port), weight)
-	if err := backends.Update(&id, be, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("insert backend: %w", err)
-	}
-	if err := selectionArray.Update(count, &id, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("update selection_array: %w", err)
-	}
-	count++
-	if err := countMap.Update(uint32(0), &count, ebpf.UpdateExist); err != nil {
-		return fmt.Errorf("update count: %w", err)
-	}
-	return nil
-}
-
-func wlcDeleteBackend(backends, countMap, selectionArray *ebpf.Map,
-	ip string, port uint16,
-	lookupIPPort lookupIPPortFn, lookupConns lookupConnsFn) error {
-
-	pip, err := parseIPv4Cfg(ip)
-	if err != nil {
-		return err
-	}
-	var count uint32
-	if err := countMap.Lookup(uint32(0), &count); err != nil {
-		return fmt.Errorf("lookup count: %w", err)
-	}
-	for i := uint32(0); i < count; i++ {
-		var id uint32
-		if err := selectionArray.Lookup(i, &id); err != nil {
-			continue
-		}
-		bip, bport, err := lookupIPPort(backends, id)
-		if err != nil {
-			continue
-		}
-		if bip != pip || bport != htons(port) {
-			continue
-		}
-		conns, err := lookupConns(backends, id)
-		if err != nil {
-			return fmt.Errorf("lookup conns: %w", err)
-		}
-		if conns != 0 {
-			return fmt.Errorf("backend %s:%d has %d active connections", ip, port, conns)
-		}
-		last := count - 1
-		if i != last {
-			var lastID uint32
-			if err := selectionArray.Lookup(last, &lastID); err != nil {
-				return fmt.Errorf("lookup last id: %w", err)
-			}
-			if err := selectionArray.Update(i, &lastID, ebpf.UpdateExist); err != nil {
-				return fmt.Errorf("swap selection_array: %w", err)
-			}
-		}
-		zero := uint32(0)
-		if err := selectionArray.Update(last, &zero, ebpf.UpdateExist); err != nil {
-			return fmt.Errorf("zero selection_array last slot: %w", err)
-		}
-		if err := backends.Delete(&id); err != nil {
-			return fmt.Errorf("delete backend: %w", err)
 		}
 		count--
 		if err := countMap.Update(uint32(0), &count, ebpf.UpdateExist); err != nil {
@@ -341,8 +268,8 @@ func newLcEstVariant() (*lcEstVariant, error) {
 	return v, nil
 }
 
-func (v *lcEstVariant) Program() *ebpf.Program { return v.objs.XdpLoadBalancer }
-func (v *lcEstVariant) Close()                 { v.objs.Close() }
+func (v *lcEstVariant) Program() *ebpf.Program                          { return v.objs.XdpLoadBalancer }
+func (v *lcEstVariant) Close()                                          { v.objs.Close() }
 func (v *lcEstVariant) UpdateWeight(_ string, _ uint16, _ uint16) error { return nil }
 
 func (v *lcEstVariant) Init(cfgPath string) error {
@@ -373,21 +300,30 @@ func (v *lcEstVariant) Init(cfgPath string) error {
 }
 
 func (v *lcEstVariant) AddBackend(ip string, port uint16, _ uint16) error {
-	return lcAddBackend(v.objs.lbMaps.Backends, v.objs.lbMaps.BackendCount, ip, port,
-		func(ip uint32, port uint16) interface{} {
+	return arrayAddBackend(v.objs.lbMaps.Backends, v.objs.lbMaps.BackendCount, ip, port, 0,
+		func(m *ebpf.Map, idx uint32) (uint32, uint16, error) {
+			var b lbBackend
+			if err := m.Lookup(idx, &b); err != nil {
+				return 0, 0, err
+			}
+			return b.Ip, b.Port, nil
+		},
+		func(ip uint32, port, _ uint16) interface{} {
 			return &lbBackend{Ip: ip, Port: port, Conns: 0}
-		})
+		},
+		htons)
 }
 
 func (v *lcEstVariant) DeleteBackend(ip string, port uint16) error {
-	return lcDeleteBackend(v.objs.lbMaps.Backends, v.objs.lbMaps.BackendCount, ip, port,
-		func() interface{} { return &lbBackend{} },
-		func(m *ebpf.Map, dst, src uint32) error {
+	return arrayDeleteBackend(
+		v.objs.lbMaps.Backends, v.objs.lbMaps.BackendCount,
+		ip, port,
+		func(m *ebpf.Map, idx uint32) (uint32, uint16, error) {
 			var b lbBackend
-			if err := m.Lookup(src, &b); err != nil {
-				return err
+			if err := m.Lookup(idx, &b); err != nil {
+				return 0, 0, err
 			}
-			return m.Update(dst, &b, ebpf.UpdateExist)
+			return b.Ip, b.Port, nil
 		},
 		func(m *ebpf.Map, idx uint32) (uint32, error) {
 			var b lbBackend
@@ -396,13 +332,15 @@ func (v *lcEstVariant) DeleteBackend(ip string, port uint16) error {
 			}
 			return b.Conns, nil
 		},
-		func(m *ebpf.Map, idx uint32) (uint32, uint16, error) {
+		func(m *ebpf.Map, dst, src uint32) error {
 			var b lbBackend
-			if err := m.Lookup(idx, &b); err != nil {
-				return 0, 0, err
+			if err := m.Lookup(src, &b); err != nil {
+				return err
 			}
-			return b.Ip, b.Port, nil
-		})
+			return m.Update(dst, &b, ebpf.UpdateExist)
+		},
+		func() interface{} { return &lbBackend{} },
+		htons, nil)
 }
 
 func (v *lcEstVariant) AddService(ip string, port uint16) error {
@@ -444,8 +382,8 @@ func newLcSynVariant() (*lcSynVariant, error) {
 	return v, nil
 }
 
-func (v *lcSynVariant) Program() *ebpf.Program { return v.objs.XdpLoadBalancer }
-func (v *lcSynVariant) Close()                 { v.objs.Close() }
+func (v *lcSynVariant) Program() *ebpf.Program                          { return v.objs.XdpLoadBalancer }
+func (v *lcSynVariant) Close()                                          { v.objs.Close() }
 func (v *lcSynVariant) UpdateWeight(_ string, _ uint16, _ uint16) error { return nil }
 
 func (v *lcSynVariant) Init(cfgPath string) error {
@@ -476,21 +414,30 @@ func (v *lcSynVariant) Init(cfgPath string) error {
 }
 
 func (v *lcSynVariant) AddBackend(ip string, port uint16, _ uint16) error {
-	return lcAddBackend(v.objs.lb2Maps.Backends, v.objs.lb2Maps.BackendCount, ip, port,
-		func(ip uint32, port uint16) interface{} {
+	return arrayAddBackend(v.objs.lb2Maps.Backends, v.objs.lb2Maps.BackendCount, ip, port, 0,
+		func(m *ebpf.Map, idx uint32) (uint32, uint16, error) {
+			var b lb2Backend
+			if err := m.Lookup(idx, &b); err != nil {
+				return 0, 0, err
+			}
+			return b.Ip, b.Port, nil
+		},
+		func(ip uint32, port, _ uint16) interface{} {
 			return &lb2Backend{Ip: ip, Port: port, Conns: 0}
-		})
+		},
+		htons)
 }
 
 func (v *lcSynVariant) DeleteBackend(ip string, port uint16) error {
-	return lcDeleteBackend(v.objs.lb2Maps.Backends, v.objs.lb2Maps.BackendCount, ip, port,
-		func() interface{} { return &lb2Backend{} },
-		func(m *ebpf.Map, dst, src uint32) error {
+	return arrayDeleteBackend(
+		v.objs.lb2Maps.Backends, v.objs.lb2Maps.BackendCount,
+		ip, port,
+		func(m *ebpf.Map, idx uint32) (uint32, uint16, error) {
 			var b lb2Backend
-			if err := m.Lookup(src, &b); err != nil {
-				return err
+			if err := m.Lookup(idx, &b); err != nil {
+				return 0, 0, err
 			}
-			return m.Update(dst, &b, ebpf.UpdateExist)
+			return b.Ip, b.Port, nil
 		},
 		func(m *ebpf.Map, idx uint32) (uint32, error) {
 			var b lb2Backend
@@ -499,13 +446,15 @@ func (v *lcSynVariant) DeleteBackend(ip string, port uint16) error {
 			}
 			return b.Conns, nil
 		},
-		func(m *ebpf.Map, idx uint32) (uint32, uint16, error) {
+		func(m *ebpf.Map, dst, src uint32) error {
 			var b lb2Backend
-			if err := m.Lookup(idx, &b); err != nil {
-				return 0, 0, err
+			if err := m.Lookup(src, &b); err != nil {
+				return err
 			}
-			return b.Ip, b.Port, nil
-		})
+			return m.Update(dst, &b, ebpf.UpdateExist)
+		},
+		func() interface{} { return &lb2Backend{} },
+		htons, nil)
 }
 
 func (v *lcSynVariant) AddService(ip string, port uint16) error {
@@ -528,6 +477,8 @@ func (v *lcSynVariant) DeleteService(ip string, port uint16) error {
 }
 
 // ── WLC-EST variant (lb3 / lb_wlc_est.c) ─────────────────────────────────────
+// backends is now BPF_MAP_TYPE_ARRAY keyed by index (no selection_array, no next_id).
+// struct backend layout: { ip, port, conns, weight }
 
 type wlcEstVariant struct{ objs lb3Objects }
 
@@ -537,10 +488,10 @@ func newWlcEstVariant() (*wlcEstVariant, error) {
 		return nil, fmt.Errorf("load BPF objects (wlc-est): %w", err)
 	}
 	if err := pinMaps(map[string]*ebpf.Map{
-		pinDir + "/backends":        v.objs.lb3Maps.Backends,
-		pinDir + "/backend_count":   v.objs.lb3Maps.BackendCount,
-		pinDir + "/services":        v.objs.lb3Maps.Services,
-		pinDir + "/selection_array": v.objs.lb3Maps.SelectionArray,
+		pinDir + "/backends":      v.objs.lb3Maps.Backends,
+		pinDir + "/backend_count": v.objs.lb3Maps.BackendCount,
+		pinDir + "/services":      v.objs.lb3Maps.Services,
+		pinDir + "/conntrack":     v.objs.lb3Maps.Conntrack,
 	}, "wlc"); err != nil {
 		v.objs.Close()
 		return nil, err
@@ -569,15 +520,9 @@ func (v *wlcEstVariant) Init(cfgPath string) error {
 		if err != nil {
 			return fmt.Errorf("backend[%d] IP: %w", i, err)
 		}
-		id := nextBackendID
-		nextBackendID++
-		be := lb3Backend{Ip: ip, Port: htons(b.Port), Conns: 0, Weight: defaultWeight(b.Weight)}
-		if err := v.objs.lb3Maps.Backends.Update(&id, &be, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("update backends id=%d: %w", id, err)
-		}
-		pos := uint32(i)
-		if err := v.objs.lb3Maps.SelectionArray.Update(pos, &id, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("update selection_array[%d]: %w", i, err)
+		be := lb3Backend{Ip: ip, Port: b.Port, Conns: 0, Weight: defaultWeight(b.Weight)}
+		if err := v.objs.lb3Maps.Backends.Update(uint32(i), &be, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update backends[%d]: %w", i, err)
 		}
 	}
 	cnt := uint32(len(cfg.Backends))
@@ -585,34 +530,71 @@ func (v *wlcEstVariant) Init(cfgPath string) error {
 }
 
 func (v *wlcEstVariant) UpdateWeight(ip string, port, weight uint16) error {
-	return wlcUpdateWeight(v.objs.lb3Maps.Backends, v.objs.lb3Maps.BackendCount,
-		v.objs.lb3Maps.SelectionArray, ip, port, weight)
+	pip, err := parseIPv4Cfg(ip)
+	if err != nil {
+		return err
+	}
+	var count uint32
+	if err := v.objs.lb3Maps.BackendCount.Lookup(uint32(0), &count); err != nil {
+		return fmt.Errorf("lookup count: %w", err)
+	}
+	for i := uint32(0); i < count; i++ {
+		var b lb3Backend
+		if err := v.objs.lb3Maps.Backends.Lookup(i, &b); err != nil {
+			continue
+		}
+		if b.Ip == pip && b.Port == port {
+			b.Weight = weight
+			return v.objs.lb3Maps.Backends.Update(i, &b, ebpf.UpdateExist)
+		}
+	}
+	return fmt.Errorf("backend %s:%d not found", ip, port)
 }
 
 func (v *wlcEstVariant) AddBackend(ip string, port, weight uint16) error {
-	return wlcAddBackend(v.objs.lb3Maps.Backends, v.objs.lb3Maps.BackendCount,
-		v.objs.lb3Maps.SelectionArray, ip, port, weight,
-		func(ip uint32, port, weight uint16) interface{} {
-			return &lb3Backend{Ip: ip, Port: port, Conns: 0, Weight: weight}
-		})
-}
-
-func (v *wlcEstVariant) DeleteBackend(ip string, port uint16) error {
-	return wlcDeleteBackend(v.objs.lb3Maps.Backends, v.objs.lb3Maps.BackendCount,
-		v.objs.lb3Maps.SelectionArray, ip, port,
-		func(m *ebpf.Map, id uint32) (uint32, uint16, error) {
+	return arrayAddBackend(v.objs.lb3Maps.Backends, v.objs.lb3Maps.BackendCount, ip, port, defaultWeight(weight),
+		func(m *ebpf.Map, idx uint32) (uint32, uint16, error) {
 			var b lb3Backend
-			if err := m.Lookup(&id, &b); err != nil {
+			if err := m.Lookup(idx, &b); err != nil {
 				return 0, 0, err
 			}
 			return b.Ip, b.Port, nil
 		},
-		func(m *ebpf.Map, id uint32) (uint32, error) {
+		func(ip uint32, port, w uint16) interface{} {
+			return &lb3Backend{Ip: ip, Port: port, Conns: 0, Weight: w}
+		},
+		func(p uint16) uint16 { return p })
+}
+
+func (v *wlcEstVariant) DeleteBackend(ip string, port uint16) error {
+	return arrayDeleteBackend(
+		v.objs.lb3Maps.Backends, v.objs.lb3Maps.BackendCount,
+		ip, port,
+		func(m *ebpf.Map, idx uint32) (uint32, uint16, error) {
 			var b lb3Backend
-			if err := m.Lookup(&id, &b); err != nil {
+			if err := m.Lookup(idx, &b); err != nil {
+				return 0, 0, err
+			}
+			return b.Ip, b.Port, nil
+		},
+		func(m *ebpf.Map, idx uint32) (uint32, error) {
+			var b lb3Backend
+			if err := m.Lookup(idx, &b); err != nil {
 				return 0, err
 			}
 			return b.Conns, nil
+		},
+		func(m *ebpf.Map, dst, src uint32) error {
+			var b lb3Backend
+			if err := m.Lookup(src, &b); err != nil {
+				return err
+			}
+			return m.Update(dst, &b, ebpf.UpdateExist)
+		},
+		func() interface{} { return &lb3Backend{} },
+		func(p uint16) uint16 { return p },
+		func(oldIdx, newIdx uint32) error {
+			return patchConntrackLb3(v.objs.lb3Maps.Conntrack, oldIdx, newIdx)
 		})
 }
 
@@ -645,10 +627,10 @@ func newWlcSynVariant() (*wlcSynVariant, error) {
 		return nil, fmt.Errorf("load BPF objects (wlc-syn): %w", err)
 	}
 	if err := pinMaps(map[string]*ebpf.Map{
-		pinDir + "/backends":        v.objs.lb4Maps.Backends,
-		pinDir + "/backend_count":   v.objs.lb4Maps.BackendCount,
-		pinDir + "/services":        v.objs.lb4Maps.Services,
-		pinDir + "/selection_array": v.objs.lb4Maps.SelectionArray,
+		pinDir + "/backends":      v.objs.lb4Maps.Backends,
+		pinDir + "/backend_count": v.objs.lb4Maps.BackendCount,
+		pinDir + "/services":      v.objs.lb4Maps.Services,
+		pinDir + "/conntrack":     v.objs.lb4Maps.Conntrack,
 	}, "wlc"); err != nil {
 		v.objs.Close()
 		return nil, err
@@ -677,15 +659,9 @@ func (v *wlcSynVariant) Init(cfgPath string) error {
 		if err != nil {
 			return fmt.Errorf("backend[%d] IP: %w", i, err)
 		}
-		id := nextBackendID
-		nextBackendID++
-		be := lb4Backend{Ip: ip, Port: htons(b.Port), Conns: 0, Weight: defaultWeight(b.Weight)}
-		if err := v.objs.lb4Maps.Backends.Update(&id, &be, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("update backends id=%d: %w", id, err)
-		}
-		pos := uint32(i)
-		if err := v.objs.lb4Maps.SelectionArray.Update(pos, &id, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("update selection_array[%d]: %w", i, err)
+		be := lb4Backend{Ip: ip, Port: b.Port, Conns: 0, Weight: defaultWeight(b.Weight)}
+		if err := v.objs.lb4Maps.Backends.Update(uint32(i), &be, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update backends[%d]: %w", i, err)
 		}
 	}
 	cnt := uint32(len(cfg.Backends))
@@ -693,34 +669,71 @@ func (v *wlcSynVariant) Init(cfgPath string) error {
 }
 
 func (v *wlcSynVariant) UpdateWeight(ip string, port, weight uint16) error {
-	return wlcUpdateWeight(v.objs.lb4Maps.Backends, v.objs.lb4Maps.BackendCount,
-		v.objs.lb4Maps.SelectionArray, ip, port, weight)
+	pip, err := parseIPv4Cfg(ip)
+	if err != nil {
+		return err
+	}
+	var count uint32
+	if err := v.objs.lb4Maps.BackendCount.Lookup(uint32(0), &count); err != nil {
+		return fmt.Errorf("lookup count: %w", err)
+	}
+	for i := uint32(0); i < count; i++ {
+		var b lb4Backend
+		if err := v.objs.lb4Maps.Backends.Lookup(i, &b); err != nil {
+			continue
+		}
+		if b.Ip == pip && b.Port == port {
+			b.Weight = weight
+			return v.objs.lb4Maps.Backends.Update(i, &b, ebpf.UpdateExist)
+		}
+	}
+	return fmt.Errorf("backend %s:%d not found", ip, port)
 }
 
 func (v *wlcSynVariant) AddBackend(ip string, port, weight uint16) error {
-	return wlcAddBackend(v.objs.lb4Maps.Backends, v.objs.lb4Maps.BackendCount,
-		v.objs.lb4Maps.SelectionArray, ip, port, weight,
-		func(ip uint32, port, weight uint16) interface{} {
-			return &lb4Backend{Ip: ip, Port: port, Conns: 0, Weight: weight}
-		})
-}
-
-func (v *wlcSynVariant) DeleteBackend(ip string, port uint16) error {
-	return wlcDeleteBackend(v.objs.lb4Maps.Backends, v.objs.lb4Maps.BackendCount,
-		v.objs.lb4Maps.SelectionArray, ip, port,
-		func(m *ebpf.Map, id uint32) (uint32, uint16, error) {
+	return arrayAddBackend(v.objs.lb4Maps.Backends, v.objs.lb4Maps.BackendCount, ip, port, defaultWeight(weight),
+		func(m *ebpf.Map, idx uint32) (uint32, uint16, error) {
 			var b lb4Backend
-			if err := m.Lookup(&id, &b); err != nil {
+			if err := m.Lookup(idx, &b); err != nil {
 				return 0, 0, err
 			}
 			return b.Ip, b.Port, nil
 		},
-		func(m *ebpf.Map, id uint32) (uint32, error) {
+		func(ip uint32, port, w uint16) interface{} {
+			return &lb4Backend{Ip: ip, Port: port, Conns: 0, Weight: w}
+		},
+		func(p uint16) uint16 { return p })
+}
+
+func (v *wlcSynVariant) DeleteBackend(ip string, port uint16) error {
+	return arrayDeleteBackend(
+		v.objs.lb4Maps.Backends, v.objs.lb4Maps.BackendCount,
+		ip, port,
+		func(m *ebpf.Map, idx uint32) (uint32, uint16, error) {
 			var b lb4Backend
-			if err := m.Lookup(&id, &b); err != nil {
+			if err := m.Lookup(idx, &b); err != nil {
+				return 0, 0, err
+			}
+			return b.Ip, b.Port, nil
+		},
+		func(m *ebpf.Map, idx uint32) (uint32, error) {
+			var b lb4Backend
+			if err := m.Lookup(idx, &b); err != nil {
 				return 0, err
 			}
 			return b.Conns, nil
+		},
+		func(m *ebpf.Map, dst, src uint32) error {
+			var b lb4Backend
+			if err := m.Lookup(src, &b); err != nil {
+				return err
+			}
+			return m.Update(dst, &b, ebpf.UpdateExist)
+		},
+		func() interface{} { return &lb4Backend{} },
+		func(p uint16) uint16 { return p },
+		func(oldIdx, newIdx uint32) error {
+			return patchConntrackLb4(v.objs.lb4Maps.Conntrack, oldIdx, newIdx)
 		})
 }
 

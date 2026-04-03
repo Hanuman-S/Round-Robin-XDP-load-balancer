@@ -56,7 +56,7 @@ func main() {
 		log.Fatalf("remove memlock: %v", err)
 	}
 
-	cleanPins(*algo)
+	cleanPins()
 
 	var (
 		v   variant
@@ -91,13 +91,6 @@ func main() {
 
 	if err := v.Init(*cfgPath); err != nil {
 		log.Fatalf("init: %v", err)
-	}
-
-	// For wlc, pin the next_id counter so lbctl can allocate stable IDs.
-	if *algo == "wlc" {
-		if err := pinNextID(); err != nil {
-			log.Fatalf("pin next_id: %v", err)
-		}
 	}
 
 	ifc, err := net.InterfaceByName(*iface)
@@ -150,39 +143,13 @@ func adaptiveLoop() {
 	}
 }
 
-// pinNextID creates a single-entry array map at /sys/fs/bpf/lbxdp/next_id
-// holding the current value of nextBackendID so lbctl can allocate IDs
-// without a daemon round-trip.
-func pinNextID() error {
-	m, err := ebpf.NewMap(&ebpf.MapSpec{
-		Type:       ebpf.Array,
-		KeySize:    4,
-		ValueSize:  4,
-		MaxEntries: 1,
-	})
-	if err != nil {
-		return err
-	}
-	defer m.Close()
-	if err := m.Update(uint32(0), &nextBackendID, ebpf.UpdateAny); err != nil {
-		return err
-	}
-	return m.Pin(pinDir + "/next_id")
-}
-
 // cleanPins removes any pinned BPF maps from a previous run.
-// The set of pins is a superset so it is safe to call for both algos.
-func cleanPins(algo string) {
+func cleanPins() {
 	pins := []string{
 		"/sys/fs/bpf/lbxdp/backends",
 		"/sys/fs/bpf/lbxdp/backend_count",
 		"/sys/fs/bpf/lbxdp/services",
-	}
-	if algo == "wlc" {
-		pins = append(pins,
-			"/sys/fs/bpf/lbxdp/selection_array",
-			"/sys/fs/bpf/lbxdp/next_id",
-		)
+		"/sys/fs/bpf/lbxdp/conntrack",
 	}
 	for _, p := range pins {
 		os.Remove(p)
